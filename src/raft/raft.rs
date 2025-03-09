@@ -1,4 +1,4 @@
-use futures::{channel::mpsc, stream::FuturesUnordered, StreamExt};
+use futures::{channel::mpsc, stream::FuturesUnordered, SinkExt, StreamExt};
 use madsim::{
     fs, net,
     rand::{self, Rng},
@@ -19,6 +19,8 @@ pub struct RaftHandle {
 
 type MsgSender = mpsc::UnboundedSender<ApplyMsg>;
 pub type MsgRecver = mpsc::UnboundedReceiver<ApplyMsg>;
+
+type AppendSender = tokio::sync::mpsc::Sender<()>;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -58,6 +60,7 @@ struct Raft {
     peers: Vec<SocketAddr>,
     me: usize,
     apply_ch: MsgSender,
+    append_tx: AppendSender,
 
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
@@ -107,16 +110,39 @@ impl fmt::Debug for Raft {
 impl RaftHandle {
     pub async fn new(peers: Vec<SocketAddr>, me: usize) -> (Self, MsgRecver) {
         let (apply_ch, recver) = mpsc::unbounded();
+        let (append_tx, mut append_rx) = tokio::sync::mpsc::channel(100);
+
         let inner = Arc::new(Mutex::new(Raft {
             peers,
             me,
             apply_ch,
+            append_tx,
             state: State::default(),
         }));
         let handle = RaftHandle { inner };
         // initialize from state persisted before a crash
         handle.restore().await.expect("failed to restore");
         handle.start_rpc_server();
+
+        let raft = handle.inner.clone();
+        let this = handle.clone();
+        let election_timeout = Raft::generate_election_timeout();
+        task::spawn(async move {
+            loop {
+                // Create a sleep future for the timeout duration.
+                let sleep = tokio::time::sleep(election_timeout);
+                tokio::select! {
+                    _ = sleep => {
+                        info!("No heartbeat received within {:?}", election_timeout);
+                        info!("Starting election");
+                        this.request_vote(RequestVoteArgs {}).await.unwrap();
+                    }
+                    Some(_) = append_rx.recv() => {
+                        // A heartbeat was received, reset the timer by restarting the loop.
+                    }
+                }
+            }
+        });
 
         (handle, recver)
     }
@@ -218,13 +244,28 @@ impl RaftHandle {
             let this = this.clone();
             async move { this.request_vote(args).await.unwrap() }
         });
-        // add more RPC handers here
+        net.add_rpc_handler(move |args: AppendEntriesArgs| {
+            let this = this.clone();
+            async move { this.append_entries(args).await.unwrap() }
+        });
     }
 
     async fn request_vote(&self, args: RequestVoteArgs) -> Result<RequestVoteReply> {
         let reply = {
             let mut this = self.inner.lock().unwrap();
             this.request_vote(args)
+        };
+        // if you need to persist or call async functions here,
+        // make sure the lock is scoped and dropped.
+        self.persist().await.expect("failed to persist");
+        Ok(reply)
+    }
+
+    async fn append_entries(&self, args: AppendEntriesArgs) -> Result<AppendEntriesReply> {
+        let reply = {
+            let mut this = self.inner.lock().unwrap();
+            this.append_tx.send(()).await.unwrap();
+            unimplemented!("handle AppendEntries RPC");
         };
         // if you need to persist or call async functions here,
         // make sure the lock is scoped and dropped.
@@ -259,7 +300,7 @@ impl Raft {
     // Here is an example to generate random number.
     fn generate_election_timeout() -> Duration {
         // see rand crate for more details
-        Duration::from_millis(rand::rng().gen_range(150..300))
+        Duration::from_millis(madsim::rand::thread_rng().gen_range(150..300))
     }
 
     // Here is an example to send RPC and manage concurrent tasks.
@@ -288,8 +329,7 @@ impl Raft {
             while let Some(res) = rpcs.next().await {
                 todo!("handle RPC results");
             }
-        })
-        .detach(); // NOTE: you need to detach a task explicitly, or it will be cancelled on drop
+        });
     }
 }
 
@@ -300,5 +340,15 @@ struct RequestVoteArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestVoteReply {
+    // Your data here.
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppendEntriesArgs {
+    // Your data here.
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppendEntriesReply {
     // Your data here.
 }
