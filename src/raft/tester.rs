@@ -1,6 +1,5 @@
 use super::raft::*;
 use futures::StreamExt;
-use log::*;
 use madsim::{
     fs::FsSim,
     net::NetSim,
@@ -19,6 +18,7 @@ use std::{
     },
     time::Duration,
 };
+use tracing::{info, debug};
 
 pub struct RaftTester {
     handle: Handle,
@@ -47,12 +47,12 @@ impl RaftTester {
 
     async fn new_ext(n: usize, snapshot: bool) -> Self {
         let handle = Handle::current();
-        let nodes = (0..n)
+        let nodes = (2..n+2)
             .map(|i| {
                 handle
                     .create_node()
                     .name(format!("raft-{i}"))
-                    .ip([0, 0, 1, i as _].into())
+                    .ip([10, 0, 0, i as _].into())
                     .build()
                     .id()
             })
@@ -60,8 +60,8 @@ impl RaftTester {
         let tester = RaftTester {
             n,
             nodes,
-            addrs: (0..n)
-                .map(|i| SocketAddr::from(([0, 0, 1, i as _], 0)))
+            addrs: (2..n+2)
+                .map(|i| SocketAddr::from(([10, 0, 0, i as _], 0)))
                 .collect(),
             rafts: Mutex::new(vec![None; n]),
             connected: (0..n).map(|_| AtomicBool::new(false)).collect(),
@@ -286,14 +286,14 @@ impl RaftTester {
     pub fn disconnect(&self, i: usize) {
         debug!("disconnect({i})");
         self.connected[i].store(false, Ordering::SeqCst);
-        self.net.disconnect(self.nodes[i]);
+        self.net.clog_node(self.nodes[i]);
     }
 
     /// attach server i to the net.
     pub fn connect(&self, i: usize) {
         debug!("connect({i})");
         self.connected[i].store(true, Ordering::SeqCst);
-        self.net.connect(self.nodes[i]);
+        self.net.unclog_node(self.nodes[i]);
     }
 
     /// Is server i connected?
@@ -312,7 +312,7 @@ impl RaftTester {
     }
 
     async fn start1_ext(&self, i: usize, snapshot: bool) {
-        self.crash1(i);
+        // self.crash1(i);
 
         let addrs = self.addrs.clone();
         let handle = self.handle.get_node(self.nodes[i]).unwrap();

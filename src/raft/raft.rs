@@ -15,6 +15,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex, Weak},
 };
+use tracing::{debug, info, trace};
 
 mod logs;
 mod msg;
@@ -167,6 +168,7 @@ impl RaftHandle {
     pub async fn new(peers: Vec<SocketAddr>, me: usize) -> (Self, MsgRecver) {
         let n = peers.len();
         let (apply_ch, recver) = mpsc::unbounded();
+        trace!("Binding node {} to {}", me+1,peers[me]);
         let ep = Arc::new(Endpoint::bind(peers[me]).await.expect("failed to bind"));
         let inner = Arc::new(Mutex::new(Raft {
             peers,
@@ -358,7 +360,7 @@ impl Raft {
 
         async move {
             // FIXME: crash on partial write
-            let mut file = File::create("state").await?;
+            let file = File::create("state").await?;
             file.write_all_at(&data, 0).await?;
             file.sync_all().await?;
             Ok(())
@@ -370,7 +372,7 @@ impl Raft {
         let f1 = self.persist();
         let f2 = async move {
             // FIXME: crash on partial write
-            let mut file = File::create("snapshot").await?;
+            let file = File::create("snapshot").await?;
             file.write_all_at(&snapshot, 0).await?;
             file.sync_all().await?;
             Ok(()) as io::Result<()>
@@ -699,6 +701,7 @@ impl Raft {
     }
 
     fn request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
+        trace!("Received RequestVoteArgs: {:?}", args);
         // Your code here (2A, 2B).
         // Reply false if term < currentTerm (§5.1)
         if args.term < self.state.term {

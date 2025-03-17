@@ -1,6 +1,5 @@
 use super::tester::*;
 use futures::future;
-use log::*;
 use madsim::{
     rand::{self, Rng},
     task, time,
@@ -12,13 +11,23 @@ use std::{
     },
     time::Duration,
 };
+use tracing::{info, warn, Level};
 
 /// The tester generously allows solutions to complete elections in one second
 /// (much more than the paper's range of timeouts).
 const RAFT_ELECTION_TIMEOUT: Duration = Duration::from_millis(1000);
 
+fn init_logger() {
+    // construct a subscriber that prints formatted traces to stdout
+    let subscriber = tracing_subscriber::fmt().with_max_level(Level::TRACE).finish();
+    // use that subscriber to process traces emitted after this point
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+}
+
 #[madsim::test]
 async fn initial_election_2a() {
+    init_logger();
+
     let servers = 3;
     let t = RaftTester::new(servers).await;
 
