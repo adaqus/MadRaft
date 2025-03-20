@@ -168,7 +168,7 @@ impl RaftHandle {
     pub async fn new(peers: Vec<SocketAddr>, me: usize) -> (Self, MsgRecver) {
         let n = peers.len();
         let (apply_ch, recver) = mpsc::unbounded();
-        trace!("Binding node {} to {}", me+1,peers[me]);
+        trace!("Binding node {} to {}", me + 1, peers[me]);
         let ep = Arc::new(Endpoint::bind(peers[me]).await.expect("failed to bind"));
         let inner = Arc::new(Mutex::new(Raft {
             peers,

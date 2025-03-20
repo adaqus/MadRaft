@@ -18,10 +18,14 @@ use tracing::{info, warn, Level};
 const RAFT_ELECTION_TIMEOUT: Duration = Duration::from_millis(1000);
 
 fn init_logger() {
-    // construct a subscriber that prints formatted traces to stdout
-    let subscriber = tracing_subscriber::fmt().with_max_level(Level::TRACE).finish();
-    // use that subscriber to process traces emitted after this point
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+    if std::env::var("TRACING").is_ok() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .with_file(true)
+            .with_line_number(true)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    }
 }
 
 #[madsim::test]
@@ -488,7 +492,9 @@ async fn count_2b() {
 }
 
 #[madsim::test]
-async fn persist1_2c() {
+async fn persistence_node_crash_2c() {
+    init_logger();
+
     let servers = 3;
     let t = RaftTester::new(servers).await;
 
@@ -498,10 +504,8 @@ async fn persist1_2c() {
 
     // crash and re-start all
     for i in 0..servers {
-        t.start1(i).await;
-    }
-    for i in 0..servers {
-        t.disconnect(i);
+        t.crash_and_restart_node(i);
+        t.start_raft(i).await;
         t.connect(i);
     }
 
@@ -509,7 +513,8 @@ async fn persist1_2c() {
 
     let leader1 = t.check_one_leader().await;
     t.disconnect(leader1);
-    t.start1(leader1).await;
+    t.crash_and_restart_node(leader1);
+    t.start_raft(leader1).await;
     t.connect(leader1);
 
     t.one(Entry { x: 13 }, servers, true).await;
@@ -517,16 +522,18 @@ async fn persist1_2c() {
     let leader2 = t.check_one_leader().await;
     t.disconnect(leader2);
     t.one(Entry { x: 14 }, servers - 1, true).await;
-    t.start1(leader2).await;
+    t.crash_and_restart_node(leader2);
+    t.start_raft(leader2).await;
     t.connect(leader2);
 
-    // wait for leader2 to join before killing i3
+    // // wait for leader2 to join before killing i3
     t.wait(4, servers, None).await;
 
     let i3 = (t.check_one_leader().await + 1) % servers;
     t.disconnect(i3);
     t.one(Entry { x: 15 }, servers - 1, true).await;
-    t.start1(i3).await;
+    t.crash_and_restart_node(i3);
+    t.start_raft(i3).await;
     t.connect(i3);
 
     t.one(Entry { x: 16 }, servers, true).await;
@@ -535,7 +542,7 @@ async fn persist1_2c() {
 }
 
 #[madsim::test]
-async fn persist2_2c() {
+async fn persistence_connection_loss_2c() {
     let servers = 5;
     let t = RaftTester::new(servers).await;
 
@@ -558,14 +565,11 @@ async fn persist2_2c() {
         t.disconnect((leader1 + 3) % servers);
         t.disconnect((leader1 + 4) % servers);
 
-        t.start1((leader1 + 1) % servers).await;
-        t.start1((leader1 + 2) % servers).await;
         t.connect((leader1 + 1) % servers);
         t.connect((leader1 + 2) % servers);
 
         time::sleep(RAFT_ELECTION_TIMEOUT).await;
 
-        t.start1((leader1 + 3) % servers).await;
         t.connect((leader1 + 3) % servers);
 
         t.one(Entry { x: 10 + index }, servers - 2, true).await;
@@ -581,7 +585,7 @@ async fn persist2_2c() {
 }
 
 #[madsim::test]
-async fn persist3_2c() {
+async fn persistence_net_partition_2c() {
     let servers = 3;
     let t = RaftTester::new(servers).await;
 
@@ -594,15 +598,15 @@ async fn persist3_2c() {
 
     t.one(Entry { x: 102 }, 2, true).await;
 
-    t.crash1((leader + 0) % servers);
-    t.crash1((leader + 1) % servers);
+    t.crash_and_restart_node((leader + 0) % servers);
+    t.crash_and_restart_node((leader + 1) % servers);
     t.connect((leader + 2) % servers);
-    t.start1((leader + 0) % servers).await;
+    t.start_raft((leader + 0) % servers).await;
     t.connect((leader + 0) % servers);
 
     t.one(Entry { x: 103 }, 2, true).await;
 
-    t.start1((leader + 1) % servers).await;
+    t.start_raft((leader + 1) % servers).await;
     t.connect((leader + 1) % servers);
 
     t.one(Entry { x: 104 }, servers, true).await;
@@ -645,14 +649,14 @@ async fn figure_8_2c() {
         time::sleep(delay).await;
 
         if let Some(leader) = leader {
-            t.crash1(leader);
+            t.crash_and_restart_node(leader);
             nup -= 1;
         }
 
         if nup < 3 {
             let s = random.gen_range(0..servers);
             if !t.is_started(s) {
-                t.start1(s).await;
+                t.start_raft(s).await;
                 nup += 1;
             }
         }
@@ -660,7 +664,7 @@ async fn figure_8_2c() {
 
     for i in 0..servers {
         if !t.is_started(i) {
-            t.start1(i).await;
+            t.start_raft(i).await;
         }
     }
     t.one(random.gen_entry(), servers, true).await;
@@ -819,14 +823,14 @@ async fn internal_churn(unreliable: bool) {
         if random.gen_bool(0.5) {
             let i = random.gen_range(0..servers);
             if !t.is_started(i) {
-                t.start1(i).await;
+                t.start_raft(i).await;
             }
             t.connect(i);
         }
         if random.gen_bool(0.2) {
             let i = random.gen_range(0..servers);
             if t.is_started(i) {
-                t.crash1(i);
+                t.crash_and_restart_node(i);
             }
         }
 
@@ -842,7 +846,7 @@ async fn internal_churn(unreliable: bool) {
 
     for i in 0..servers {
         if !t.is_started(i) {
-            t.start1(i).await;
+            t.start_raft(i).await;
         }
         t.connect(i);
     }
@@ -891,7 +895,7 @@ async fn snap_common(disconnect: bool, reliable: bool, crash: bool) {
             t.one(random.gen_entry(), servers - 1, true).await;
         }
         if crash {
-            t.crash1(victim);
+            t.crash_and_restart_node(victim);
             t.one(random.gen_entry(), servers - 1, true).await;
         }
         // send enough to get a snapshot
@@ -912,7 +916,7 @@ async fn snap_common(disconnect: bool, reliable: bool, crash: bool) {
             leader1 = t.check_one_leader().await;
         }
         if crash {
-            t.start1_snapshot(victim).await;
+            t.start_raft_snapshop(victim).await;
             t.connect(victim);
             t.one(random.gen_entry(), servers, true).await;
             leader1 = t.check_one_leader().await;

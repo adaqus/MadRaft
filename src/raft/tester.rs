@@ -18,7 +18,7 @@ use std::{
     },
     time::Duration,
 };
-use tracing::{info, debug};
+use tracing::{debug, info, trace};
 
 pub struct RaftTester {
     handle: Handle,
@@ -35,6 +35,7 @@ pub struct RaftTester {
 }
 
 pub const SNAPSHOT_INTERVAL: u64 = 10;
+pub const IP_OFFSET: usize = 10;
 
 impl RaftTester {
     pub async fn new(n: usize) -> Self {
@@ -47,7 +48,7 @@ impl RaftTester {
 
     async fn new_ext(n: usize, snapshot: bool) -> Self {
         let handle = Handle::current();
-        let nodes = (2..n+2)
+        let nodes = (IP_OFFSET..n + IP_OFFSET)
             .map(|i| {
                 handle
                     .create_node()
@@ -60,8 +61,8 @@ impl RaftTester {
         let tester = RaftTester {
             n,
             nodes,
-            addrs: (2..n+2)
-                .map(|i| SocketAddr::from(([10, 0, 0, i as _], 0)))
+            addrs: (IP_OFFSET..n + IP_OFFSET)
+                .map(|i| SocketAddr::from(([10, 0, 0, i as _], 1)))
                 .collect(),
             rafts: Mutex::new(vec![None; n]),
             connected: (0..n).map(|_| AtomicBool::new(false)).collect(),
@@ -72,7 +73,7 @@ impl RaftTester {
             net: madsim::plugin::simulator(),
         };
         for i in 0..n {
-            tester.start1_ext(i, snapshot).await;
+            tester.do_start_raft(i, snapshot).await;
             tester.connect(i);
         }
         tester
@@ -244,6 +245,7 @@ impl RaftTester {
             for _ in 0..self.n {
                 starts = (starts + 1) % self.n;
                 if !self.connected[starts].load(Ordering::SeqCst) || !self.is_started(starts) {
+                    trace!("Node {} is not connected or not started", starts);
                     continue;
                 }
                 match self.start(starts, cmd.clone()).await {
@@ -273,9 +275,10 @@ impl RaftTester {
                     time::sleep(Duration::from_millis(20)).await;
                 }
                 if !retry {
-                    panic!("one({:?}) failed to reach agreement", cmd);
+                    panic!("one({:?}) failed to reach agreement (no retry)", cmd);
                 }
             } else {
+                trace!("nobody claims to be leader, retrying");
                 time::sleep(Duration::from_millis(50)).await;
             }
         }
@@ -302,18 +305,16 @@ impl RaftTester {
     }
 
     /// Start or re-start a Raft.
-    pub async fn start1(&self, i: usize) {
-        self.start1_ext(i, false).await;
+    pub async fn start_raft(&self, i: usize) {
+        self.do_start_raft(i, false).await;
     }
 
     /// Start or re-start a Raft with snapshot.
-    pub async fn start1_snapshot(&self, i: usize) {
-        self.start1_ext(i, true).await;
+    pub async fn start_raft_snapshop(&self, i: usize) {
+        self.do_start_raft(i, true).await;
     }
 
-    async fn start1_ext(&self, i: usize, snapshot: bool) {
-        // self.crash1(i);
-
+    async fn do_start_raft(&self, i: usize, snapshot: bool) {
         let addrs = self.addrs.clone();
         let handle = self.handle.get_node(self.nodes[i]).unwrap();
         let (raft, mut apply_recver) = handle.spawn(RaftHandle::new(addrs, i)).await.unwrap();
@@ -346,10 +347,17 @@ impl RaftTester {
         });
     }
 
-    pub fn crash1(&self, i: usize) {
+    pub fn crash_and_restart_node(&self, i: usize) {
         debug!("crash({i})");
         self.handle.kill(self.nodes[i]);
         self.rafts.lock().unwrap()[i] = None;
+
+        self.restart_node(i);
+    }
+
+    pub fn restart_node(&self, i: usize) {
+        debug!("restart node({i})");
+        self.handle.restart(self.nodes[i]);
     }
 
     /// End a test.
