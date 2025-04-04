@@ -1,13 +1,19 @@
 use crate::raft;
 
 use self::{logs::Logs, msg::*};
-use futures::{channel::mpsc, join, select_biased, stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::{
+    channel::mpsc,
+    join, select_biased,
+    stream::{AbortHandle, Abortable, FuturesUnordered},
+    FutureExt, StreamExt,
+};
 use madsim::{
     fs::{self, File},
     net::Endpoint,
     rand::{self, Rng},
     task::JoinHandle,
     time::{self, *},
+    Request,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -91,11 +97,8 @@ struct Persist {
 
 impl fmt::Debug for Raft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Raft({},t={},l=[{},{}],{:?})",
-            self.me,
-        )
+        // write!(f, "Raft({},t={},l=[{},{}],{:?})", self.me,)
+        write!(f, "Raft({})", self.me,)
     }
 }
 
@@ -118,7 +121,7 @@ impl RaftHandle {
         handle.start_rpc_server(ep);
 
         let raft = handle.inner.clone();
-        let heartbeat_timeout = raft.lock().expect("unlock Rart").generate_election_timeout();
+        let heartbeat_timeout = Raft::generate_election_timeout();
 
         madsim::task::spawn(async move {
             loop {
@@ -217,7 +220,8 @@ impl RaftHandle {
         match fs::read("snapshot").await {
             Ok(snapshot) => {
                 let mut this = self.inner.lock().unwrap();
-                this.snapshot = snapshot;
+                // this.snapshot = snapshot;
+                todo!("restore snapshot");
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -233,11 +237,9 @@ impl RaftHandle {
         Ok(())
     }
 
-    fn start_rpc_server(&self) {
-        let net = net::NetLocalHandle::current();
-
+    fn start_rpc_server(&self, endpoint: Arc<Endpoint>) {
         let this = self.clone();
-        net.add_rpc_handler(move |args: RequestVoteArgs| {
+        endpoint.add_rpc_handler(move |args: RequestVoteArgs| {
             let this = this.clone();
             async move { this.request_vote(args).await.unwrap() }
         });
@@ -306,51 +308,49 @@ impl Raft {
     // Here is an example to generate random number.
     fn generate_election_timeout() -> Duration {
         // see rand crate for more details
-        Duration::from_millis(rand::rng().gen_range(150..300))
+        Duration::from_millis(rand::thread_rng().gen_range(150..300))
     }
 
     // Here is an example to send RPC and manage concurrent tasks.
     fn send_vote_request(&mut self) {
-        let args = RequestVoteArgs { term: self.state.term, candidate_id: self.me, last_log_index: self.state.last_log_index, last_log_term: self.state.last_log_term  };
+        let args = RequestVoteArgs {
+            term: self.state.term,
+            candidate_id: self.me,
+            last_log_index: self.state.last_log_index,
+            last_log_term: self.state.last_log_term,
+        };
         let endpoint = self.ep.clone();
 
+        let (voting_abort, abort_registration) = AbortHandle::new_pair();
+
         let mut rpcs = FuturesUnordered::new();
+        let rpcs2 = Abortable::new(rpcs, abort_registration);
         for (i, &peer) in self.peers.iter().enumerate() {
             if i == self.me {
                 continue;
             }
-            // NOTE: `call` function takes ownerships
-            let net = net.clone();
             let args = args.clone();
-            rpcs.push(async move {
-                endpoint.call(peer, args).await
-            });
+            rpcs.push(async move { endpoint.call(peer, args).await });
         }
-
 
         let timeout = Self::generate_election_timeout();
         let me = self.me;
         let quorum = (self.peers.len() + 1) / 2;
 
-        rpcs.take_while(|_| votes_cnt.get_mut() >= quorum);
-
         let handle_votes = async move {
             let mut votes = vec![];
             while let Some(resp) = rpcs.next().await {
                 match resp {
-                    None => {
-                        debug!("Raft(me): all responses received");
-                    },
-                    Some(Err(e)) => {
-                        warn!("Raft(me): RPC error: {:?}", e);
-                    },
-                    Some(Ok(reply)) => {
+                    Err(e) => {
+                        warn!("Raft({me}): RPC error: {:?}", e);
+                    }
+                    Ok(reply) => {
                         votes.push(reply);
                         if votes.len() >= quorum {
                             break;
                         }
                     }
-                }
+                };
             }
 
             votes
@@ -371,8 +371,8 @@ impl Raft {
     }
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[rtype("RequestVoteReply")]
 struct RequestVoteArgs {
     term: u64,
     candidate_id: usize,
