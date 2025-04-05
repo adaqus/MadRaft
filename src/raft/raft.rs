@@ -3,15 +3,13 @@ use crate::raft;
 use self::{logs::Logs, msg::*};
 use futures::{
     channel::mpsc,
-    join, select_biased,
     stream::{AbortHandle, Abortable, FuturesUnordered},
-    FutureExt, StreamExt,
+    FutureExt, SinkExt, StreamExt,
 };
 use madsim::{
     fs::{self, File},
     net::Endpoint,
     rand::{self, Rng},
-    task::JoinHandle,
     time::{self, *},
     Request,
 };
@@ -21,7 +19,7 @@ use std::{
     future::Future,
     io,
     net::SocketAddr,
-    sync::{atomic::AtomicU8, Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 use tracing::{debug, info, trace, warn};
 
@@ -31,6 +29,7 @@ mod msg;
 #[derive(Clone)]
 pub struct RaftHandle {
     inner: Arc<Mutex<Raft>>,
+    heartbeat_sender: mpsc::UnboundedSender<()>,
 }
 
 type MsgSender = mpsc::UnboundedSender<ApplyMsg>;
@@ -104,8 +103,8 @@ impl fmt::Debug for Raft {
 
 impl RaftHandle {
     pub async fn new(peers: Vec<SocketAddr>, me: usize) -> (Self, MsgRecver) {
-        let n = peers.len();
         let (apply_ch, recver) = mpsc::unbounded();
+        let (heartbeat_sender, mut heartbeat_receiver) = mpsc::unbounded();
         trace!("Binding node {} to {}", me + 1, peers[me]);
         let ep = Arc::new(Endpoint::bind(peers[me]).await.expect("failed to bind"));
         let inner = Arc::new(Mutex::new(Raft {
@@ -115,7 +114,10 @@ impl RaftHandle {
             apply_ch,
             state: State::default(),
         }));
-        let handle = RaftHandle { inner };
+        let handle = RaftHandle {
+            inner,
+            heartbeat_sender,
+        };
         // initialize from state persisted before a crash
         handle.restore().await.expect("failed to restore");
         handle.start_rpc_server(ep);
@@ -125,20 +127,28 @@ impl RaftHandle {
 
         madsim::task::spawn(async move {
             loop {
-                let sleep = time::sleep(heartbeat_timeout);
+                let mut sleep = time::sleep(heartbeat_timeout).fuse();
                 // If timeout and heartbeat happen simultaneously, prefer timeout
                 futures::select_biased! {
                     _ = sleep => {
                         // Log a warning if no heartbeat was received in time.
-                        warn!("Raft(me): No heartbeat received within {:?}", heartbeat_timeout);
-                        let raft_guard = raft.lock().expect("unlock Raft");
+                        warn!("Raft({me}): No heartbeat received within {:?}", heartbeat_timeout);
+                        let mut raft_guard = raft.lock().expect("unlock Raft");
                         raft_guard.state.role = Role::Candidate;
                         raft_guard.state.term += 1;
                         raft_guard.send_vote_request();
-                    }
-                    Some(_) = rx.recv() => {
-                        debug!("Raft(me): Heartbeat received, reset election timeout.");
-                    }
+                    },
+                    msg = heartbeat_receiver.next() => {
+                        match msg {
+                            None => {
+                                warn!("Raft({me}): Heartbeat channel closed");
+                                break;
+                            }
+                            Some(_) => {
+                                debug!("Raft({me}): Heartbeat received, reset election timeout.");
+                            }
+                        }
+                    },
                 }
             }
         });
@@ -219,7 +229,7 @@ impl RaftHandle {
     async fn restore(&self) -> io::Result<()> {
         match fs::read("snapshot").await {
             Ok(snapshot) => {
-                let mut this = self.inner.lock().unwrap();
+                let this = self.inner.lock().unwrap();
                 // this.snapshot = snapshot;
                 todo!("restore snapshot");
             }
@@ -241,19 +251,36 @@ impl RaftHandle {
         let this = self.clone();
         endpoint.add_rpc_handler(move |args: RequestVoteArgs| {
             let this = this.clone();
-            async move { this.request_vote(args).await.unwrap() }
+            async move { this.request_vote_handler(args).await.unwrap() }
         });
-        // add more RPC handers here
+        let this = self.clone();
+        endpoint.add_rpc_handler(move |args: AppendEntriesArgs| {
+            let mut this = this.clone();
+            async move { this.append_entries_handler(args).await.unwrap() }
+        });
     }
 
-    async fn request_vote(&self, args: RequestVoteArgs) -> Result<RequestVoteReply> {
+    async fn request_vote_handler(&self, args: RequestVoteArgs) -> Result<RequestVoteReply> {
         let reply = {
             let mut this = self.inner.lock().unwrap();
-            this.request_vote(args)
+            this.request_vote_handler(args)
         };
-        // if you need to persist or call async functions here,
-        // make sure the lock is scoped and dropped.
-        self.persist().await.expect("failed to persist");
+        self.persist().await.expect("failed to   persist");
+        Ok(reply)
+    }
+
+    async fn append_entries_handler(
+        &mut self,
+        args: AppendEntriesArgs,
+    ) -> Result<AppendEntriesReply> {
+        self.heartbeat_sender
+            .send(())
+            .await
+            .expect("Reset election timeout");
+        let reply = {
+            let mut this = self.inner.lock().unwrap();
+            this.append_entries_handler(args)
+        };
         Ok(reply)
     }
 }
@@ -284,7 +311,7 @@ struct State {
 
 // HINT: put mutable non-async functions here
 impl Raft {
-    fn start(&mut self, data: &[u8]) -> Result<Start> {
+    fn start(&mut self, _data: &[u8]) -> Result<Start> {
         if !self.state.is_leader() {
             let leader = (self.me + 1) % self.peers.len();
             return Err(Error::NotLeader(leader));
@@ -301,8 +328,15 @@ impl Raft {
         self.apply_ch.unbounded_send(msg).unwrap();
     }
 
-    fn request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
+    fn request_vote_handler(&mut self, _args: RequestVoteArgs) -> RequestVoteReply {
         todo!("handle RequestVote RPC");
+    }
+
+    fn append_entries_handler(&mut self, _args: AppendEntriesArgs) -> AppendEntriesReply {
+        AppendEntriesReply {
+            term: self.state.term,
+            success: true,
+        }
     }
 
     // Here is an example to generate random number.
@@ -321,45 +355,51 @@ impl Raft {
         };
         let endpoint = self.ep.clone();
 
-        let (voting_abort, abort_registration) = AbortHandle::new_pair();
-
-        let mut rpcs = FuturesUnordered::new();
-        let rpcs2 = Abortable::new(rpcs, abort_registration);
+        let rpcs = FuturesUnordered::new();
         for (i, &peer) in self.peers.iter().enumerate() {
             if i == self.me {
                 continue;
             }
             let args = args.clone();
-            rpcs.push(async move { endpoint.call(peer, args).await });
+            let ep = endpoint.clone();
+            rpcs.push(async move { ep.call(peer, args).await });
         }
 
         let timeout = Self::generate_election_timeout();
         let me = self.me;
         let quorum = (self.peers.len() + 1) / 2;
 
-        let handle_votes = async move {
-            let mut votes = vec![];
-            while let Some(resp) = rpcs.next().await {
-                match resp {
-                    Err(e) => {
-                        warn!("Raft({me}): RPC error: {:?}", e);
-                    }
-                    Ok(reply) => {
-                        votes.push(reply);
-                        if votes.len() >= quorum {
-                            break;
-                        }
-                    }
-                };
-            }
+        let (voting_abort, abort_registration) = AbortHandle::new_pair();
+        let mut abortable_rpcs = Abortable::new(rpcs, abort_registration);
 
-            votes
-        };
+        let mut handle_votes = Box::pin(
+            async move {
+                let mut votes = vec![];
+                while let Some(resp) = abortable_rpcs.next().await {
+                    match resp {
+                        Err(e) => {
+                            warn!("Raft({me}): RPC error: {:?}", e);
+                        }
+                        Ok(reply) => {
+                            votes.push(reply);
+                            if votes.len() >= quorum {
+                                break;
+                            }
+                        }
+                    };
+                }
+
+                votes
+            }
+            .fuse(),
+        );
 
         madsim::task::spawn(async move {
             futures::select_biased! {
-                _ = time::sleep(timeout) => {
+                _ = time::sleep(timeout).fuse() => {
                     warn!("Raft(me): election timed out");
+                    // Abort election if it is still running
+                    voting_abort.abort();
                     todo!("React on election timeout")
                 },
                 _ = handle_votes => {
@@ -367,7 +407,7 @@ impl Raft {
                     todo!("React on receiving enough votes");
                 }
             }
-        })
+        });
     }
 }
 
@@ -391,4 +431,27 @@ enum RequestVoteResult {
     AllResponded,
     Error,
     PeerReply(RequestVoteReply),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[rtype("AppendEntriesReply")]
+pub struct AppendEntriesArgs {
+    pub term: u64,
+    pub leader_id: u64,
+    pub prev_log_index: u64,
+    pub prev_log_term: u64,
+    pub entries: Vec<Log>,
+    pub leader_commit: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Log {
+    pub term: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendEntriesReply {
+    pub term: u64,
+    pub success: bool,
 }
