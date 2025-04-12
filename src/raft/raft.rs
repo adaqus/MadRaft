@@ -91,7 +91,8 @@ impl State {
 /// Data needs to be persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Persist {
-    // Your data here.
+    current_term: u64,
+    voted_for: Option<usize>,
 }
 
 impl fmt::Debug for Raft {
@@ -136,7 +137,7 @@ impl RaftHandle {
                         let mut raft_guard = raft.lock().expect("unlock Raft");
                         raft_guard.state.role = Role::Candidate;
                         raft_guard.state.term += 1;
-                        raft_guard.send_vote_request();
+                        raft_guard.perform_election();
                     },
                     msg = heartbeat_receiver.next() => {
                         match msg {
@@ -175,6 +176,12 @@ impl RaftHandle {
         raft.state.term
     }
 
+    /// The current term of this peer.
+    pub fn voted_for(&self) -> Option<usize> {
+        let raft = self.inner.lock().unwrap();
+        raft.state.voted_for
+    }
+
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
         let raft = self.inner.lock().unwrap();
@@ -206,8 +213,8 @@ impl RaftHandle {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     async fn persist(&self) -> io::Result<()> {
-        let persist: Persist = todo!("persist state");
-        let snapshot: Vec<u8> = todo!("persist snapshot");
+        let persist: Persist = Persist { current_term: self.term(), voted_for: self.voted_for() };
+        let snapshot: Vec<u8> = vec![]; //TODO real snapshot
         let state = bincode::serialize(&persist).unwrap();
 
         // you need to store persistent state in file "state"
@@ -265,7 +272,7 @@ impl RaftHandle {
             let mut this = self.inner.lock().unwrap();
             this.request_vote_handler(args)
         };
-        self.persist().await.expect("failed to   persist");
+        self.persist().await.expect("failed to persist");
         Ok(reply)
     }
 
@@ -307,6 +314,7 @@ struct State {
     role: Role,
     last_log_index: u64,
     last_log_term: u64,
+    voted_for: Option<usize>,
 }
 
 // HINT: put mutable non-async functions here
@@ -328,8 +336,29 @@ impl Raft {
         self.apply_ch.unbounded_send(msg).unwrap();
     }
 
-    fn request_vote_handler(&mut self, _args: RequestVoteArgs) -> RequestVoteReply {
-        todo!("handle RequestVote RPC");
+    fn request_vote_handler(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
+        // TODO if also candidate then don't vote (???)
+
+        if self.state.term > args.term {
+            return RequestVoteReply {
+                term: self.state.term,
+                vote_granted: false,
+            };
+        }
+
+        if (self.state.voted_for.is_none() || self.state.voted_for == Some(args.candidate_id))
+            && self.state.last_log_term <= args.last_log_term
+            && self.state.last_log_index <= args.last_log_index
+        {
+            self.state.voted_for = Some(args.candidate_id);
+            self.state.term = args.term;
+            return RequestVoteReply {
+                term: self.state.term,
+                vote_granted: true,
+            };
+        }
+
+        RequestVoteReply { term: self.state.term, vote_granted: false }
     }
 
     fn append_entries_handler(&mut self, _args: AppendEntriesArgs) -> AppendEntriesReply {
@@ -345,8 +374,7 @@ impl Raft {
         Duration::from_millis(rand::thread_rng().gen_range(150..300))
     }
 
-    // Here is an example to send RPC and manage concurrent tasks.
-    fn send_vote_request(&mut self) {
+    fn perform_election(&mut self) {
         let args = RequestVoteArgs {
             term: self.state.term,
             candidate_id: self.me,
@@ -368,6 +396,7 @@ impl Raft {
         let timeout = Self::generate_election_timeout();
         let me = self.me;
         let quorum = (self.peers.len() + 1) / 2;
+        let current_term = self.state.term;
 
         let (voting_abort, abort_registration) = AbortHandle::new_pair();
         let mut abortable_rpcs = Abortable::new(rpcs, abort_registration);
@@ -382,11 +411,24 @@ impl Raft {
                         }
                         Ok(reply) => {
                             votes.push(reply);
-                            if votes.len() >= quorum {
-                                break;
-                            }
                         }
                     };
+                }
+
+                // Vote for self
+                let mut vote_cnt = 1;
+                for vote in &votes {
+                    if vote.term > current_term {
+                        todo!("React on receiving a vote with higher term");
+                    }
+                    if vote.vote_granted {
+                        vote_cnt += 1;
+                    }
+
+                    if vote_cnt >= quorum {
+                        info!("Raft({me}): received enough votes");
+                        break;
+                    }
                 }
 
                 votes
@@ -399,11 +441,13 @@ impl Raft {
                 _ = time::sleep(timeout).fuse() => {
                     warn!("Raft(me): election timed out");
                     // Abort election if it is still running
-                    voting_abort.abort();
+                    voting_abort.abort(); // Is it really needed?
                     todo!("React on election timeout")
                 },
-                _ = handle_votes => {
+                votes = handle_votes => {
                     info!("Raft(me): received enough votes");
+                    for vote in votes {
+                    }
                     todo!("React on receiving enough votes");
                 }
             }
