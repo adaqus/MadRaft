@@ -213,7 +213,10 @@ impl RaftHandle {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     async fn persist(&self) -> io::Result<()> {
-        let persist: Persist = Persist { current_term: self.term(), voted_for: self.voted_for() };
+        let persist: Persist = Persist {
+            current_term: self.term(),
+            voted_for: self.voted_for(),
+        };
         let snapshot: Vec<u8> = vec![]; //TODO real snapshot
         let state = bincode::serialize(&persist).unwrap();
 
@@ -358,7 +361,10 @@ impl Raft {
             };
         }
 
-        RequestVoteReply { term: self.state.term, vote_granted: false }
+        RequestVoteReply {
+            term: self.state.term,
+            vote_granted: false,
+        }
     }
 
     fn append_entries_handler(&mut self, _args: AppendEntriesArgs) -> AppendEntriesReply {
@@ -401,7 +407,13 @@ impl Raft {
         let (voting_abort, abort_registration) = AbortHandle::new_pair();
         let mut abortable_rpcs = Abortable::new(rpcs, abort_registration);
 
-        let mut handle_votes = Box::pin(
+        enum VotingResult {
+            Outdated { peer_term: u64 },
+            Won,
+            NoQuorum,
+        }
+
+        let mut election = Box::pin(
             async move {
                 let mut votes = vec![];
                 while let Some(resp) = abortable_rpcs.next().await {
@@ -417,21 +429,26 @@ impl Raft {
 
                 // Vote for self
                 let mut vote_cnt = 1;
+                let mut result = VotingResult::NoQuorum;
+
                 for vote in &votes {
                     if vote.term > current_term {
-                        todo!("React on receiving a vote with higher term");
+                        info!("Raft({me}): peer term ({}) is higher than current term ({current_term})", vote.term);
+                        result = VotingResult::Outdated { peer_term: vote.term };
+                        break;
                     }
                     if vote.vote_granted {
                         vote_cnt += 1;
                     }
 
                     if vote_cnt >= quorum {
-                        info!("Raft({me}): received enough votes");
+                        info!("Raft({me}): received enough votes ({vote_cnt})");
+                        result = VotingResult::Won;
                         break;
                     }
                 }
 
-                votes
+                result
             }
             .fuse(),
         );
@@ -444,11 +461,13 @@ impl Raft {
                     voting_abort.abort(); // Is it really needed?
                     todo!("React on election timeout")
                 },
-                votes = handle_votes => {
-                    info!("Raft(me): received enough votes");
-                    for vote in votes {
+                result = election => {
+                    match result {
+                        VotingResult::Outdated { peer_term } => todo!("React on outdated term"),
+                        VotingResult::Won => todo!("React on winning election"),
+                        VotingResult::NoQuorum => todo!("React on no quorum"),
                     }
-                    todo!("React on receiving enough votes");
+
                 }
             }
         });
