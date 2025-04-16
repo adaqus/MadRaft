@@ -10,6 +10,7 @@ use madsim::{
     fs::{self, File},
     net::Endpoint,
     rand::{self, Rng},
+    task::JoinHandle,
     time::{self, *},
     Request,
 };
@@ -114,6 +115,7 @@ impl RaftHandle {
             ep: ep.clone(),
             apply_ch,
             state: State::default(),
+            pending_election: None,
         }));
         let handle = RaftHandle {
             inner,
@@ -308,6 +310,8 @@ struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     state: State,
+
+    pending_election: Option<JoinHandle<()>>,
 }
 
 /// State of a raft peer.
@@ -389,7 +393,7 @@ impl Raft {
         };
         let endpoint = self.ep.clone();
 
-        let rpcs = FuturesUnordered::new();
+        let mut rpcs = FuturesUnordered::new();
         for (i, &peer) in self.peers.iter().enumerate() {
             if i == self.me {
                 continue;
@@ -404,9 +408,6 @@ impl Raft {
         let quorum = (self.peers.len() + 1) / 2;
         let current_term = self.state.term;
 
-        let (voting_abort, abort_registration) = AbortHandle::new_pair();
-        let mut abortable_rpcs = Abortable::new(rpcs, abort_registration);
-
         enum VotingResult {
             Outdated { peer_term: u64 },
             Won,
@@ -416,7 +417,7 @@ impl Raft {
         let mut election = Box::pin(
             async move {
                 let mut votes = vec![];
-                while let Some(resp) = abortable_rpcs.next().await {
+                while let Some(resp) = rpcs.next().await {
                     match resp {
                         Err(e) => {
                             warn!("Raft({me}): RPC error: {:?}", e);
@@ -453,12 +454,10 @@ impl Raft {
             .fuse(),
         );
 
-        madsim::task::spawn(async move {
+        self.pending_election = Some(madsim::task::spawn(async move {
             futures::select_biased! {
                 _ = time::sleep(timeout).fuse() => {
                     warn!("Raft(me): election timed out");
-                    // Abort election if it is still running
-                    voting_abort.abort(); // Is it really needed?
                     todo!("React on election timeout")
                 },
                 result = election => {
@@ -467,10 +466,9 @@ impl Raft {
                         VotingResult::Won => todo!("React on winning election"),
                         VotingResult::NoQuorum => todo!("React on no quorum"),
                     }
-
                 }
             }
-        });
+        }));
     }
 }
 
