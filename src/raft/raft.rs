@@ -20,7 +20,7 @@ use std::{
     future::Future,
     io,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 use tracing::{debug, info, trace, warn};
 
@@ -115,12 +115,19 @@ impl RaftHandle {
             ep: ep.clone(),
             apply_ch,
             state: State::default(),
+            this: Weak::new(),
             pending_election: None,
         }));
+
         let handle = RaftHandle {
             inner,
             heartbeat_sender,
         };
+
+        let mut raft = handle.inner.lock().unwrap();
+        raft.this = Arc::downgrade(&handle.inner);
+        drop(raft);
+
         // initialize from state persisted before a crash
         handle.restore().await.expect("failed to restore");
         handle.start_rpc_server(ep);
@@ -311,6 +318,8 @@ struct Raft {
     // state a Raft server must maintain.
     state: State,
 
+    // Self-reference to use in async tasks
+    this: Weak<Mutex<Self>>,
     pending_election: Option<JoinHandle<()>>,
 }
 
@@ -454,21 +463,38 @@ impl Raft {
             .fuse(),
         );
 
+        let this = self.this.clone();
+
         self.pending_election = Some(madsim::task::spawn(async move {
             futures::select_biased! {
                 _ = time::sleep(timeout).fuse() => {
-                    warn!("Raft(me): election timed out");
-                    todo!("React on election timeout")
+                    warn!("Raft(me): election timed out, waiting for another one");
                 },
                 result = election => {
+                    let that = match this.upgrade() {
+                        Some(raft) => raft,
+                        None => {
+                            warn!("Raft({me}): Raft instance is gone");
+                            return;
+                        }
+                    };
+                    let mut that = that.lock().unwrap();
                     match result {
-                        VotingResult::Outdated { peer_term } => todo!("React on outdated term"),
-                        VotingResult::Won => todo!("React on winning election"),
-                        VotingResult::NoQuorum => todo!("React on no quorum"),
+                        VotingResult::Outdated { peer_term } => that.change_state(Role::Follower, peer_term),
+                        VotingResult::Won => that.change_state(Role::Leader, current_term),
+                        VotingResult::NoQuorum => info!("Raft({me}): no quorum, staying a candidate")
                     }
                 }
             }
         }));
+    }
+
+    fn change_state(&mut self, role: Role, term: u64) {
+        info!("Raft({}): changing state to {role:?}, term {term}", self.me);
+        self.state.role = role;
+        self.state.term = term;
+        self.state.voted_for = None;
+        self.pending_election = None;
     }
 }
 
