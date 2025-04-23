@@ -100,7 +100,10 @@ impl RaftTester {
             }
             for (&term, leaders) in &leaders {
                 if leaders.len() > 1 {
-                    panic!("term {} has {:?} (>1) leaders", term, leaders);
+                    panic!(
+                        "Term {} more than 1 leader. Current leaders: {:?}",
+                        term, leaders
+                    );
                 }
             }
             if !leaders.is_empty() {

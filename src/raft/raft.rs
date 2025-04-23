@@ -30,11 +30,12 @@ mod msg;
 #[derive(Clone)]
 pub struct RaftHandle {
     inner: Arc<Mutex<Raft>>,
-    heartbeat_sender: mpsc::UnboundedSender<()>,
+    heartbeat_sender: mpsc::UnboundedSender<Term>,
 }
 
 type MsgSender = mpsc::UnboundedSender<ApplyMsg>;
 pub type MsgRecver = mpsc::UnboundedReceiver<ApplyMsg>;
+type Term = u64;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -117,6 +118,7 @@ impl RaftHandle {
             state: State::default(),
             this: Weak::new(),
             pending_election: None,
+            heartbeat_task: None,
         }));
 
         let handle = RaftHandle {
@@ -124,9 +126,10 @@ impl RaftHandle {
             heartbeat_sender,
         };
 
-        let mut raft = handle.inner.lock().unwrap();
-        raft.this = Arc::downgrade(&handle.inner);
-        drop(raft);
+        {
+            let mut raft = handle.inner.lock().unwrap();
+            raft.this = Arc::downgrade(&handle.inner);
+        }
 
         // initialize from state persisted before a crash
         handle.restore().await.expect("failed to restore");
@@ -134,6 +137,7 @@ impl RaftHandle {
 
         let raft = handle.inner.clone();
         let heartbeat_timeout = Raft::generate_election_timeout();
+        debug!("Raft({}): Heartbeat timeout: {:?}", me, heartbeat_timeout);
 
         madsim::task::spawn(async move {
             loop {
@@ -154,8 +158,14 @@ impl RaftHandle {
                                 warn!("Raft({me}): Heartbeat channel closed");
                                 break;
                             }
-                            Some(_) => {
+                            Some(term) => {
                                 debug!("Raft({me}): Heartbeat received, reset election timeout.");
+                                let mut raft_guard = raft.lock().expect("unlock Raft");
+                                // If we receive a heartbeat here, it means we can safely set following state
+                                raft_guard.pending_election = None;
+                                raft_guard.heartbeat_task = None;
+                                raft_guard.state.role = Role::Follower;
+                                raft_guard.state.term = term;
                             }
                         }
                     },
@@ -292,14 +302,19 @@ impl RaftHandle {
         &mut self,
         args: AppendEntriesArgs,
     ) -> Result<AppendEntriesReply> {
-        self.heartbeat_sender
-            .send(())
-            .await
-            .expect("Reset election timeout");
-        let reply = {
+        let (reply, current_term) = {
             let mut this = self.inner.lock().unwrap();
-            this.append_entries_handler(args)
+            (this.append_entries_handler(args), this.state.term)
         };
+
+        // We consider heartbeat as received only if Raft instance can respond with success.
+        // If so, we can reset the election timeout.
+        if reply.success {
+            self.heartbeat_sender
+                .send(current_term)
+                .await
+                .expect("Reset election timeout");
+        }
         Ok(reply)
     }
 }
@@ -321,6 +336,7 @@ struct Raft {
     // Self-reference to use in async tasks
     this: Weak<Mutex<Self>>,
     pending_election: Option<JoinHandle<()>>,
+    heartbeat_task: Option<JoinHandle<()>>,
 }
 
 /// State of a raft peer.
@@ -380,10 +396,10 @@ impl Raft {
         }
     }
 
-    fn append_entries_handler(&mut self, _args: AppendEntriesArgs) -> AppendEntriesReply {
+    fn append_entries_handler(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
         AppendEntriesReply {
             term: self.state.term,
-            success: true,
+            success: args.term < self.state.term,
         }
     }
 
@@ -474,14 +490,17 @@ impl Raft {
                     let that = match this.upgrade() {
                         Some(raft) => raft,
                         None => {
-                            warn!("Raft({me}): Raft instance is gone");
+                            warn!("Raft({me}): Election: Raft instance is gone");
                             return;
                         }
                     };
                     let mut that = that.lock().unwrap();
                     match result {
                         VotingResult::Outdated { peer_term } => that.change_state(Role::Follower, peer_term),
-                        VotingResult::Won => that.change_state(Role::Leader, current_term),
+                        VotingResult::Won => {
+                            that.change_state(Role::Leader, current_term);
+                            that.start_heartbeat_task();
+                        },
                         VotingResult::NoQuorum => info!("Raft({me}): no quorum, staying a candidate")
                     }
                 }
@@ -495,6 +514,55 @@ impl Raft {
         self.state.term = term;
         self.state.voted_for = None;
         self.pending_election = None;
+    }
+
+    fn start_heartbeat_task(&mut self) {
+        assert!(self.state.is_leader());
+
+        let me = self.me;
+        let this = self.this.clone();
+
+        self.heartbeat_task = Some(madsim::task::spawn(async move {
+            trace!("Raft({me}): starting heartbeat task");
+            loop {
+                let (args, endpoint, peers) = {
+                    let that = match this.upgrade() {
+                        Some(raft) => raft,
+                        None => {
+                            warn!("Raft({me}): Heartbeat: Raft instance is gone");
+                            return;
+                        }
+                    };
+                    let mut that = that.lock().unwrap();
+                    (
+                        AppendEntriesArgs {
+                            term: that.state.term,
+                            leader_id: that.me as u64,
+                            prev_log_index: that.state.last_log_index,
+                            prev_log_term: that.state.last_log_term,
+                            entries: vec![],
+                            leader_commit: 0, // TODO update this value
+                        },
+                        that.ep.clone(),
+                        that.peers.clone(),
+                    )
+                };
+
+                for (i, &peer) in peers.iter().enumerate() {
+                    if i == me {
+                        continue;
+                    }
+                    let ep = endpoint.clone();
+                    let args = args.clone();
+                    madsim::task::spawn(async move {
+                        trace!("Raft({me}): sending heartbeat to peer {}", peer);
+                        ep.call(peer, args).await
+                    });
+                }
+
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        }));
     }
 }
 
