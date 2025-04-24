@@ -100,7 +100,7 @@ struct Persist {
 impl fmt::Debug for Raft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // write!(f, "Raft({},t={},l=[{},{}],{:?})", self.me,)
-        write!(f, "Raft({})", self.me,)
+        write!(f, "Raft({},t={})", self.me, self.state.current_term)
     }
 }
 
@@ -137,6 +137,7 @@ impl RaftHandle {
 
         let raft = handle.inner.clone();
         let heartbeat_timeout = Raft::generate_election_timeout();
+        info!("{:?} created", raft.lock().unwrap());
         debug!("Raft({}): Heartbeat timeout: {:?}", me, heartbeat_timeout);
 
         madsim::task::spawn(async move {
@@ -146,10 +147,16 @@ impl RaftHandle {
                 futures::select_biased! {
                     _ = sleep => {
                         // Log a warning if no heartbeat was received in time.
-                        warn!("Raft({me}): No heartbeat received within {:?}", heartbeat_timeout);
                         let mut raft_guard = raft.lock().expect("unlock Raft");
+                        warn!("{:?}: No heartbeat received within {:?}", *raft_guard, heartbeat_timeout);
+                        if raft_guard.state.is_leader() {
+                            info!("{:?}: I'm the leader, no need to start election", raft_guard);
+                            continue;
+                        }
+                        trace!("Old state: {:?}", raft_guard.state);
                         raft_guard.state.role = Role::Candidate;
-                        raft_guard.state.term += 1;
+                        raft_guard.state.current_term += 1;
+                        trace!("New state: {:?}", raft_guard.state);
                         raft_guard.perform_election();
                     },
                     msg = heartbeat_receiver.next() => {
@@ -159,13 +166,15 @@ impl RaftHandle {
                                 break;
                             }
                             Some(term) => {
-                                debug!("Raft({me}): Heartbeat received, reset election timeout.");
                                 let mut raft_guard = raft.lock().expect("unlock Raft");
+                                debug!("{:?}: Heartbeat received (t={term}), reset election timeout.", raft_guard);
                                 // If we receive a heartbeat here, it means we can safely set following state
-                                raft_guard.pending_election = None;
-                                raft_guard.heartbeat_task = None;
+                                raft_guard.pending_election.take().map(|e| e.abort());
+                                raft_guard.heartbeat_task.take().map(|h| h.abort());
+                                trace!("Old state: {:?}", raft_guard.state);
                                 raft_guard.state.role = Role::Follower;
-                                raft_guard.state.term = term;
+                                raft_guard.state.current_term = term;
+                                trace!("New state: {:?}", raft_guard.state);
                             }
                         }
                     },
@@ -192,7 +201,7 @@ impl RaftHandle {
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
         let raft = self.inner.lock().unwrap();
-        raft.state.term
+        raft.state.current_term
     }
 
     /// The current term of this peer.
@@ -302,18 +311,29 @@ impl RaftHandle {
         &mut self,
         args: AppendEntriesArgs,
     ) -> Result<AppendEntriesReply> {
-        let (reply, current_term) = {
+        let leader_term = args.term;
+        let reply = {
             let mut this = self.inner.lock().unwrap();
-            (this.append_entries_handler(args), this.state.term)
+            this.append_entries_handler(args)
         };
 
         // We consider heartbeat as received only if Raft instance can respond with success.
         // If so, we can reset the election timeout.
         if reply.success {
+            {
+                let mut this = self.inner.lock().unwrap();
+                trace!(
+                    "{:?}: Heartbeat successful, updating term to {}",
+                    *this,
+                    leader_term
+                );
+            }
             self.heartbeat_sender
-                .send(current_term)
+                .send(leader_term)
                 .await
                 .expect("Reset election timeout");
+        } else {
+            trace!("{:?}: Heartbeat failed,", *self.inner.lock().unwrap(),);
         }
         Ok(reply)
     }
@@ -342,7 +362,7 @@ struct Raft {
 /// State of a raft peer.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct State {
-    term: u64,
+    current_term: u64,
     role: Role,
     last_log_index: u64,
     last_log_term: u64,
@@ -371,9 +391,9 @@ impl Raft {
     fn request_vote_handler(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
         // TODO if also candidate then don't vote (???)
 
-        if self.state.term > args.term {
+        if self.state.current_term > args.term {
             return RequestVoteReply {
-                term: self.state.term,
+                term: self.state.current_term,
                 vote_granted: false,
             };
         }
@@ -383,24 +403,35 @@ impl Raft {
             && self.state.last_log_index <= args.last_log_index
         {
             self.state.voted_for = Some(args.candidate_id);
-            self.state.term = args.term;
+            // self.state.current_term = args.term;
             return RequestVoteReply {
-                term: self.state.term,
+                term: self.state.current_term,
                 vote_granted: true,
             };
         }
 
         RequestVoteReply {
-            term: self.state.term,
+            term: self.state.current_term,
             vote_granted: false,
         }
     }
 
     fn append_entries_handler(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
-        AppendEntriesReply {
-            term: self.state.term,
-            success: args.term < self.state.term,
-        }
+        let resp = AppendEntriesReply {
+            term: self.state.current_term,
+            success: if args.term < self.state.current_term {
+                false
+            } else {
+                true
+            },
+        };
+        trace!(
+            "{:?}: append entries RPC: {:?}, response: {:?}",
+            self,
+            args,
+            resp
+        );
+        resp
     }
 
     // Here is an example to generate random number.
@@ -411,7 +442,7 @@ impl Raft {
 
     fn perform_election(&mut self) {
         let args = RequestVoteArgs {
-            term: self.state.term,
+            term: self.state.current_term,
             candidate_id: self.me,
             last_log_index: self.state.last_log_index,
             last_log_term: self.state.last_log_term,
@@ -431,7 +462,7 @@ impl Raft {
         let timeout = Self::generate_election_timeout();
         let me = self.me;
         let quorum = (self.peers.len() + 1) / 2;
-        let current_term = self.state.term;
+        let current_term = self.state.current_term;
 
         enum VotingResult {
             Outdated { peer_term: u64 },
@@ -511,9 +542,10 @@ impl Raft {
     fn change_state(&mut self, role: Role, term: u64) {
         info!("Raft({}): changing state to {role:?}, term {term}", self.me);
         self.state.role = role;
-        self.state.term = term;
+        self.state.current_term = term;
         self.state.voted_for = None;
-        self.pending_election = None;
+        self.pending_election.take().map(|e| e.abort());
+        self.heartbeat_task.take().map(|h| h.abort());
     }
 
     fn start_heartbeat_task(&mut self) {
@@ -536,7 +568,7 @@ impl Raft {
                     let mut that = that.lock().unwrap();
                     (
                         AppendEntriesArgs {
-                            term: that.state.term,
+                            term: that.state.current_term,
                             leader_id: that.me as u64,
                             prev_log_index: that.state.last_log_index,
                             prev_log_term: that.state.last_log_term,
