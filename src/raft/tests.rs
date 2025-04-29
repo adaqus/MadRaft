@@ -60,6 +60,8 @@ async fn initial_election_2a() {
 
 #[madsim::test]
 async fn reelection_2a() {
+    init_logger();
+
     let servers = 3;
     let t = RaftTester::new(servers).await;
     info!("Test (2A): election after network failure");
@@ -92,6 +94,8 @@ async fn reelection_2a() {
 
 #[madsim::test]
 async fn many_election_2a() {
+    init_logger();
+
     let servers = 7;
     let iters = 10;
     let t = RaftTester::new(servers).await;

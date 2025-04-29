@@ -100,7 +100,7 @@ struct Persist {
 impl fmt::Debug for Raft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // write!(f, "Raft({},t={},l=[{},{}],{:?})", self.me,)
-        write!(f, "Raft({},t={})", self.me, self.state.current_term)
+        write!(f, "Raft({},t={},lt={},li={})", self.me, self.state.current_term, self.state.last_log_term, self.state.last_log_index)
     }
 }
 
@@ -173,6 +173,9 @@ impl RaftHandle {
                                 raft_guard.heartbeat_task.take().map(|h| h.abort());
                                 trace!("Old state: {:?}", raft_guard.state);
                                 raft_guard.state.role = Role::Follower;
+                                if term > raft_guard.state.current_term {
+                                    raft_guard.state.voted_for = None;
+                                }
                                 raft_guard.state.current_term = term;
                                 trace!("New state: {:?}", raft_guard.state);
                             }
@@ -392,10 +395,12 @@ impl Raft {
         // TODO if also candidate then don't vote (???)
 
         if self.state.current_term > args.term {
-            return RequestVoteReply {
+            let reply =  RequestVoteReply {
                 term: self.state.current_term,
                 vote_granted: false,
             };
+            trace!("{self:?}: sending response: {reply:?} (current term: {}, arg term: {})", self.state.current_term, args.term);
+            return reply;
         }
 
         if (self.state.voted_for.is_none() || self.state.voted_for == Some(args.candidate_id))
@@ -403,17 +408,24 @@ impl Raft {
             && self.state.last_log_index <= args.last_log_index
         {
             self.state.voted_for = Some(args.candidate_id);
-            // self.state.current_term = args.term;
-            return RequestVoteReply {
+            let reply = RequestVoteReply {
                 term: self.state.current_term,
                 vote_granted: true,
             };
+            // If we are a candidate, we can stop the election, because other candidate has more fresh data
+            self.pending_election
+                .take()
+                .map(|e| e.abort());
+            trace!("{self:?}: sending response: {reply:?} (granted vote)");
+            return reply;
         }
 
-        RequestVoteReply {
+        let reply = RequestVoteReply {
             term: self.state.current_term,
             vote_granted: false,
-        }
+        };
+        trace!("{self:?}: sending response: {reply:?}, voted for {:?} != {}", self.state.voted_for, args.candidate_id);
+        reply
     }
 
     fn append_entries_handler(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
@@ -447,6 +459,7 @@ impl Raft {
             last_log_index: self.state.last_log_index,
             last_log_term: self.state.last_log_term,
         };
+        trace!("{self:?}: starting election, args: {args:?}");
         let endpoint = self.ep.clone();
 
         let mut rpcs = FuturesUnordered::new();
@@ -456,6 +469,7 @@ impl Raft {
             }
             let args = args.clone();
             let ep = endpoint.clone();
+            trace!("{self:?}: sending vote request to {i}");
             rpcs.push(async move { ep.call(peer, args).await });
         }
 
@@ -472,37 +486,33 @@ impl Raft {
 
         let mut election = Box::pin(
             async move {
-                let mut votes = vec![];
+                // Vote for self
+                let mut vote_cnt = 1;
+                let mut result = VotingResult::NoQuorum;
+
                 while let Some(resp) = rpcs.next().await {
                     match resp {
                         Err(e) => {
                             warn!("Raft({me}): RPC error: {:?}", e);
                         }
                         Ok(reply) => {
-                            votes.push(reply);
+                            trace!("Raft({me},t={current_term}): voting RPC reply: {reply:?}");
+                            if reply.term > current_term {
+                                info!("Raft({me}): peer term ({}) is higher than current term ({current_term})", reply.term);
+                                result = VotingResult::Outdated { peer_term: reply.term };
+                                break;
+                            }
+                            if reply.vote_granted {
+                                vote_cnt += 1;
+                            }
+        
+                            if vote_cnt >= quorum {
+                                info!("Raft({me}): received enough votes ({vote_cnt})");
+                                result = VotingResult::Won;
+                                break;
+                            }
                         }
                     };
-                }
-
-                // Vote for self
-                let mut vote_cnt = 1;
-                let mut result = VotingResult::NoQuorum;
-
-                for vote in &votes {
-                    if vote.term > current_term {
-                        info!("Raft({me}): peer term ({}) is higher than current term ({current_term})", vote.term);
-                        result = VotingResult::Outdated { peer_term: vote.term };
-                        break;
-                    }
-                    if vote.vote_granted {
-                        vote_cnt += 1;
-                    }
-
-                    if vote_cnt >= quorum {
-                        info!("Raft({me}): received enough votes ({vote_cnt})");
-                        result = VotingResult::Won;
-                        break;
-                    }
                 }
 
                 result
@@ -515,7 +525,7 @@ impl Raft {
         self.pending_election = Some(madsim::task::spawn(async move {
             futures::select_biased! {
                 _ = time::sleep(timeout).fuse() => {
-                    warn!("Raft(me): election timed out, waiting for another one");
+                    warn!("Raft({me}): election timed out ({timeout:?}), waiting for another one");
                 },
                 result = election => {
                     let that = match this.upgrade() {

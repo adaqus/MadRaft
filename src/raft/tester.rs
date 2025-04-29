@@ -86,7 +86,7 @@ impl RaftTester {
         let mut random = rand::thread_rng();
         let mut leaders = HashMap::<u64, Vec<usize>>::new();
         for _iters in 0..10 {
-            time::sleep(Duration::from_millis(random.gen_range(450..550))).await;
+            time::sleep(Duration::from_millis(random.gen_range(1000..2000))).await;
 
             for (i, connected) in self.connected.iter().enumerate() {
                 if !connected.load(Ordering::SeqCst) {
