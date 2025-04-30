@@ -100,7 +100,11 @@ struct Persist {
 impl fmt::Debug for Raft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // write!(f, "Raft({},t={},l=[{},{}],{:?})", self.me,)
-        write!(f, "Raft({},t={},lt={},li={})", self.me, self.state.current_term, self.state.last_log_term, self.state.last_log_index)
+        write!(
+            f,
+            "Raft({},t={},lt={},li={})",
+            self.me, self.state.current_term, self.state.last_log_term, self.state.last_log_index
+        )
     }
 }
 
@@ -143,7 +147,7 @@ impl RaftHandle {
                 let heartbeat_timeout = Raft::generate_election_timeout();
                 debug!("Raft({}): Heartbeat timeout: {:?}", me, heartbeat_timeout);
                 let mut sleep = time::sleep(heartbeat_timeout).fuse();
-                
+
                 // If timeout and heartbeat happen simultaneously, prefer timeout
                 futures::select_biased! {
                     _ = sleep => {
@@ -397,17 +401,24 @@ impl Raft {
         // TODO if also candidate then don't vote (???)
 
         if self.state.current_term > args.term {
-            let reply =  RequestVoteReply {
+            let reply = RequestVoteReply {
                 term: self.state.current_term,
                 vote_granted: false,
             };
-            trace!("{self:?}: sending response: {reply:?} (current term: {}, arg term: {})", self.state.current_term, args.term);
+            trace!(
+                "{self:?}: sending response: {reply:?} (current term: {}, arg term: {})",
+                self.state.current_term,
+                args.term
+            );
             return reply;
         }
 
         // If we are a candidate, we can stop the election, because other candidate has higher term
         if args.term > self.state.current_term {
-            trace!("{self:?}: received {:?} with higher ter, switching to follower", args);
+            trace!(
+                "{self:?}: received {:?} with higher ter, switching to follower",
+                args
+            );
             self.state.role = Role::Follower;
             self.state.current_term = args.term;
             self.state.voted_for = None;
@@ -432,7 +443,11 @@ impl Raft {
             term: self.state.current_term,
             vote_granted: false,
         };
-        trace!("{self:?}: sending response: {reply:?}, voted for {:?} != {}", self.state.voted_for, args.candidate_id);
+        trace!(
+            "{self:?}: sending response: {reply:?}, voted for {:?} != {}",
+            self.state.voted_for,
+            args.candidate_id
+        );
         reply
     }
 
@@ -513,7 +528,7 @@ impl Raft {
                             if reply.vote_granted {
                                 vote_cnt += 1;
                             }
-        
+
                             if vote_cnt >= quorum {
                                 info!("Raft({me}): received enough votes ({vote_cnt})");
                                 result = VotingResult::Won;
