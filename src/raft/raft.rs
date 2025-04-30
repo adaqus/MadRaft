@@ -136,13 +136,14 @@ impl RaftHandle {
         handle.start_rpc_server(ep);
 
         let raft = handle.inner.clone();
-        let heartbeat_timeout = Raft::generate_election_timeout();
         info!("{:?} created", raft.lock().unwrap());
-        debug!("Raft({}): Heartbeat timeout: {:?}", me, heartbeat_timeout);
 
         madsim::task::spawn(async move {
             loop {
+                let heartbeat_timeout = Raft::generate_election_timeout();
+                debug!("Raft({}): Heartbeat timeout: {:?}", me, heartbeat_timeout);
                 let mut sleep = time::sleep(heartbeat_timeout).fuse();
+                
                 // If timeout and heartbeat happen simultaneously, prefer timeout
                 futures::select_biased! {
                     _ = sleep => {
@@ -156,6 +157,7 @@ impl RaftHandle {
                         trace!("Old state: {:?}", raft_guard.state);
                         raft_guard.state.role = Role::Candidate;
                         raft_guard.state.current_term += 1;
+                        raft_guard.state.voted_for = Some(me);
                         trace!("New state: {:?}", raft_guard.state);
                         raft_guard.perform_election();
                     },
@@ -403,6 +405,16 @@ impl Raft {
             return reply;
         }
 
+        // If we are a candidate, we can stop the election, because other candidate has higher term
+        if args.term > self.state.current_term {
+            trace!("{self:?}: received {:?} with higher ter, switching to follower", args);
+            self.state.role = Role::Follower;
+            self.state.current_term = args.term;
+            self.state.voted_for = None;
+            self.pending_election.take().map(|e| e.abort());
+            self.heartbeat_task.take().map(|h| h.abort());
+        }
+
         if (self.state.voted_for.is_none() || self.state.voted_for == Some(args.candidate_id))
             && self.state.last_log_term <= args.last_log_term
             && self.state.last_log_index <= args.last_log_index
@@ -412,10 +424,6 @@ impl Raft {
                 term: self.state.current_term,
                 vote_granted: true,
             };
-            // If we are a candidate, we can stop the election, because other candidate has more fresh data
-            self.pending_election
-                .take()
-                .map(|e| e.abort());
             trace!("{self:?}: sending response: {reply:?} (granted vote)");
             return reply;
         }
