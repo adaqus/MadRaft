@@ -20,12 +20,17 @@ use std::{
     future::Future,
     io,
     net::SocketAddr,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
+    },
 };
 use tracing::{debug, info, trace, warn};
+use transport::Transport;
 
 mod logs;
 mod msg;
+mod transport;
 
 #[derive(Clone)]
 pub struct RaftHandle {
@@ -63,10 +68,14 @@ pub struct Start {
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("this node is not a leader, next leader: {0}")]
+    #[error("This node is not a leader, next leader: {0}")]
     NotLeader(usize),
+    #[error("Outdated leader term, current: {current}, peer's: {peer}")]
+    OutdatedTerm { current: u64, peer: u64 },
     #[error("IO error")]
     IO(#[from] io::Error),
+    #[error("Shutdown pending")]
+    ShutdownPending,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -123,6 +132,7 @@ impl RaftHandle {
             this: Weak::new(),
             pending_election: None,
             heartbeat_task: None,
+            commit_index: Arc::new(AtomicU64::new(0)),
         }));
 
         let handle = RaftHandle {
@@ -362,6 +372,8 @@ struct Raft {
     // state a Raft server must maintain.
     state: State,
 
+    commit_index: Arc<AtomicU64>,
+
     // Self-reference to use in async tasks
     this: Weak<Mutex<Self>>,
     pending_election: Option<JoinHandle<()>>,
@@ -369,13 +381,14 @@ struct Raft {
 }
 
 /// State of a raft peer.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 struct State {
     current_term: u64,
     role: Role,
-    last_log_index: u64,
-    last_log_term: u64,
+    last_log_index: usize, // TODO take from logs
+    last_log_term: usize,  // TODO take from logs
     voted_for: Option<usize>,
+    log: Vec<Log>,
 }
 
 // HINT: put mutable non-async functions here
@@ -636,8 +649,8 @@ impl Raft {
 struct RequestVoteArgs {
     term: u64,
     candidate_id: usize,
-    last_log_index: u64,
-    last_log_term: u64,
+    last_log_index: usize,
+    last_log_term: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,15 +671,15 @@ enum RequestVoteResult {
 pub struct AppendEntriesArgs {
     pub term: u64,
     pub leader_id: u64,
-    pub prev_log_index: u64,
-    pub prev_log_term: u64,
+    pub prev_log_index: usize,
+    pub prev_log_term: usize,
     pub entries: Vec<Log>,
     pub leader_commit: u64,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Log {
-    pub term: u64,
+    pub term: usize,
     pub data: Vec<u8>,
 }
 
@@ -674,4 +687,106 @@ pub struct Log {
 pub struct AppendEntriesReply {
     pub term: u64,
     pub success: bool,
+}
+
+pub struct FollowerSync<T: Transport> {
+    commit_index: Arc<AtomicU64>,
+    next_index: usize,
+    match_index: Arc<AtomicUsize>,
+    transport: T,
+    log: Weak<Vec<Log>>,
+    leader_id: u64,
+    leader_term: u64,
+}
+
+impl<T: Transport> FollowerSync<T> {
+    pub fn new(
+        commit_index: Arc<AtomicU64>,
+        transport: T,
+        log: Weak<Vec<Log>>,
+        next_index: usize,
+        match_index: Arc<AtomicUsize>,
+        leader_id: u64,
+        leader_term: u64,
+    ) -> Self {
+        Self {
+            commit_index,
+            transport,
+            log,
+            next_index,
+            match_index,
+            leader_id,
+            leader_term,
+        }
+    }
+
+    pub async fn sync_loop(&mut self, peer: SocketAddr) -> Result<()> {
+        loop {
+            let log = self.log.upgrade();
+            if log.is_none() {
+                debug!("Failed to read leader log state. Probably shutdown is pending.");
+                break;
+            }
+            let log = log.unwrap();
+
+            let entries = log[self.next_index..].to_vec();
+            let entries_len = entries.len();
+            let new_match_index = self.match_index.load(Ordering::Relaxed) + entries.len();
+
+            if !entries.is_empty() {
+                debug!("Send {} entries to peer {}", entries.len(), peer);
+
+                let args = AppendEntriesArgs {
+                    term: self.leader_term,
+                    leader_id: self.leader_id,
+                    prev_log_index: self.next_index - 1,
+                    prev_log_term: log[self.next_index - 1].term,
+                    entries,
+                    leader_commit: self.commit_index.load(Ordering::SeqCst),
+                };
+
+                let reply = self
+                    .transport
+                    .call_timeout(peer, args, Duration::from_secs(5))
+                    .await;
+
+                match reply {
+                    Ok(reply) => {
+                        if reply.term > self.leader_term {
+                            debug!("Peer {} has higher term, aborting sync", peer);
+                            return Err(Error::OutdatedTerm {
+                                current: self.leader_term,
+                                peer: reply.term,
+                            });
+                        }
+
+                        if reply.success {
+                            debug!("Peer {} accepted {} entries", peer, entries_len);
+                            self.match_index.store(new_match_index, Ordering::Relaxed);
+                            self.next_index = new_match_index + 1;
+                        } else {
+                            debug!(
+                                "Peer {} rejected {} entries, retrying from earlier entry",
+                                peer, entries_len
+                            );
+                            // TODO backoff
+                            time::sleep(Duration::from_millis(5)).await;
+                            self.next_index -= 1;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to send AppendEntries to peer {}: {:?}", peer, e);
+                        // TODO backoff
+                        time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
+
+                // Give the peer some time to process the entries
+                time::sleep(Raft::generate_election_timeout()).await;
+            }
+        }
+
+        Ok(())
+    }
 }
