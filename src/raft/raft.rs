@@ -1,8 +1,10 @@
 use crate::raft;
 
 use self::{logs::Logs, msg::*};
+use core::sync;
 use futures::{
     channel::mpsc,
+    lock::Mutex as AsyncMutex,
     stream::{AbortHandle, Abortable, FuturesUnordered},
     FutureExt, SinkExt, StreamExt,
 };
@@ -26,6 +28,7 @@ use std::{
     },
 };
 use tracing::{debug, info, trace, warn};
+use tracing_subscriber::field::debug;
 use transport::Transport;
 
 mod logs;
@@ -689,25 +692,33 @@ pub struct AppendEntriesReply {
     pub success: bool,
 }
 
+#[derive(Debug, PartialEq)]
+enum FollowerSyncMsg {
+    OutdatedTerm { current: u64, peer: u64 },
+    UpdateCommitIndex,
+}
+
 pub struct FollowerSync<T: Transport> {
     commit_index: Arc<AtomicU64>,
     next_index: usize,
     match_index: Arc<AtomicUsize>,
-    transport: T,
-    log: Weak<Vec<Log>>,
+    transport: Arc<AsyncMutex<T>>,
+    log: Arc<AsyncMutex<Vec<Log>>>,
     leader_id: u64,
     leader_term: u64,
+    sync_sender: mpsc::UnboundedSender<FollowerSyncMsg>,
 }
 
 impl<T: Transport> FollowerSync<T> {
     pub fn new(
         commit_index: Arc<AtomicU64>,
-        transport: T,
-        log: Weak<Vec<Log>>,
+        transport: Arc<AsyncMutex<T>>,
+        log: Arc<AsyncMutex<Vec<Log>>>,
         next_index: usize,
         match_index: Arc<AtomicUsize>,
         leader_id: u64,
         leader_term: u64,
+        sync_sender: mpsc::UnboundedSender<FollowerSyncMsg>,
     ) -> Self {
         Self {
             commit_index,
@@ -717,53 +728,67 @@ impl<T: Transport> FollowerSync<T> {
             match_index,
             leader_id,
             leader_term,
+            sync_sender,
         }
     }
 
-    pub async fn sync_loop(&mut self, peer: SocketAddr) -> Result<()> {
+    pub async fn sync_loop(&mut self, peer: SocketAddr) {
         loop {
-            let log = self.log.upgrade();
-            if log.is_none() {
-                debug!("Failed to read leader log state. Probably shutdown is pending.");
-                break;
-            }
-            let log = log.unwrap();
-
+            // debug!("FollowerSync loop");
+            let log = self.log.lock().await;
             let entries = log[self.next_index..].to_vec();
             let entries_len = entries.len();
             let new_match_index = self.match_index.load(Ordering::Relaxed) + entries.len();
+            let prev_log_term = log[self.next_index - 1].term;
 
-            if !entries.is_empty() {
+            panic!(
+                "FollowerSync: next_index={}, entries_len={}, new_match_index={}, prev_log_term={}",
+                self.next_index, entries_len, new_match_index, prev_log_term
+            );
+
+            if entries_len > 0 {
                 debug!("Send {} entries to peer {}", entries.len(), peer);
 
                 let args = AppendEntriesArgs {
                     term: self.leader_term,
                     leader_id: self.leader_id,
                     prev_log_index: self.next_index - 1,
-                    prev_log_term: log[self.next_index - 1].term,
+                    prev_log_term,
                     entries,
                     leader_commit: self.commit_index.load(Ordering::SeqCst),
                 };
 
-                let reply = self
-                    .transport
-                    .call_timeout(peer, args, Duration::from_secs(5))
-                    .await;
+                let reply = {
+                    let mut transport = self.transport.lock().await;
+                    transport
+                        .call_timeout(peer, args, Duration::from_secs(5))
+                        .await
+                };
+
+                debug!("Received reply from peer {}: {:?}", peer, reply);
 
                 match reply {
                     Ok(reply) => {
                         if reply.term > self.leader_term {
                             debug!("Peer {} has higher term, aborting sync", peer);
-                            return Err(Error::OutdatedTerm {
-                                current: self.leader_term,
-                                peer: reply.term,
-                            });
+                            self.sync_sender
+                                .send(FollowerSyncMsg::OutdatedTerm {
+                                    current: self.leader_term,
+                                    peer: reply.term,
+                                })
+                                .await
+                                .expect("Failed to send outdated term message");
+                            break;
                         }
 
                         if reply.success {
                             debug!("Peer {} accepted {} entries", peer, entries_len);
                             self.match_index.store(new_match_index, Ordering::Relaxed);
                             self.next_index = new_match_index + 1;
+                            self.sync_sender
+                                .send(FollowerSyncMsg::UpdateCommitIndex)
+                                .await
+                                .expect("Failed to send update commit index message");
                         } else {
                             debug!(
                                 "Peer {} rejected {} entries, retrying from earlier entry",
@@ -775,18 +800,117 @@ impl<T: Transport> FollowerSync<T> {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to send AppendEntries to peer {}: {:?}", peer, e);
+                        warn!(
+                            "Failed to send AppendEntries to peer {}: {:?}, retrying",
+                            peer, e
+                        );
                         // TODO backoff
                         time::sleep(Duration::from_millis(10)).await;
                         continue;
                     }
                 };
-
-                // Give the peer some time to process the entries
-                time::sleep(Raft::generate_election_timeout()).await;
             }
+
+            // Give the peer some time to process the entries
+            time::sleep(Raft::generate_election_timeout()).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicU64, AtomicUsize},
+            Arc,
+        },
+    };
+
+    use futures::StreamExt;
+    use futures::{channel::mpsc, lock::Mutex as AsyncMutex};
+    use madsim::runtime::init_logger;
+    use tracing::debug;
+    use tracing_subscriber::field::debug;
+
+    use super::{
+        transport::testing::MockTransport, AppendEntriesArgs, AppendEntriesReply, FollowerSync, Log,
+    };
+
+    #[madsim::test]
+    async fn follower_sync() {
+        if std::env::var("TRACING").is_ok() {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_file(true)
+                .with_line_number(true)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
         }
 
-        Ok(())
+        let transport = Arc::new(AsyncMutex::new(MockTransport::new()));
+        let mut log = Arc::new(AsyncMutex::new(vec![Log {
+            term: 1,
+            data: vec![1, 2, 3],
+        }]));
+        let commit_index = Arc::new(AtomicU64::new(0));
+        let next_index = 1;
+        let match_index = Arc::new(AtomicUsize::new(0));
+        let leader_id = 0;
+        let leader_term = 1;
+        let (sync_sender, mut sync_receiver) = mpsc::unbounded();
+        let mut sync = FollowerSync::new(
+            commit_index.clone(),
+            transport.clone(),
+            log.clone(),
+            next_index,
+            match_index.clone(),
+            leader_id,
+            leader_term,
+            sync_sender,
+        );
+
+        debug!("Starting follower sync");
+
+        madsim::task::spawn(async move {
+            sync.sync_loop(SocketAddr::from(([10, 0, 0, 200], 1))).await;
+        });
+
+        debug!("Locking transport");
+
+        debug!("Sending AppendEntriesReply");
+        let transport_guard = transport.lock().await;
+        transport_guard
+            .respond::<AppendEntriesArgs>(AppendEntriesReply {
+                term: 1,
+                success: true,
+            })
+            .await;
+        drop(transport_guard);
+
+        assert_eq!(0, match_index.load(std::sync::atomic::Ordering::Relaxed));
+
+        debug!("Waiting for update commit index message");
+        let update_msg = sync_receiver.next().await.unwrap();
+        assert_eq!(super::FollowerSyncMsg::UpdateCommitIndex, update_msg);
+
+        let mut log_guard = log.lock().await;
+        log_guard.push(Log {
+            term: 1,
+            data: vec![4, 5, 6],
+        });
+        drop(log_guard);
+
+        debug!("Sending AppendEntriesReply");
+        let transport_guard = transport.lock().await;
+        transport_guard
+            .respond::<AppendEntriesArgs>(AppendEntriesReply {
+                term: 1,
+                success: true,
+            })
+            .await;
+        drop(transport_guard);
+
+        debug!("Follower sync test completed");
     }
 }
