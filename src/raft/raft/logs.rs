@@ -1,56 +1,42 @@
-use super::Log;
+use super::LogEntry;
 use serde::{Deserialize, Serialize};
 use std::ops::{Index, RangeFrom};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Logs {
+pub struct Log {
     offset: usize,
-    logs: Vec<Log>,
+    entries: Vec<LogEntry>,
 }
 
-impl Logs {
+impl Log {
     pub fn new() -> Self {
-        Logs {
-            offset: 0,
-            logs: vec![Log::default()],
+        Log {
+            offset: 1,
+            entries: vec![],
         }
     }
-    pub fn begin(&self) -> usize {
-        self.offset
-    }
+
     pub fn len(&self) -> usize {
-        self.offset + self.logs.len()
+        self.entries.len()
     }
-    pub fn get(&self, index: usize) -> Option<&Log> {
+
+    pub fn get(&self, index: usize) -> Option<&LogEntry> {
         index
             .checked_sub(self.offset)
-            .and_then(|i| self.logs.get(i))
+            .and_then(|i| self.entries.get(i))
     }
-    pub fn push(&mut self, log: Log) {
-        self.logs.push(log);
+
+    pub fn push(&mut self, log: LogEntry) {
+        self.entries.push(log);
     }
-    pub fn extend_from_slice(&mut self, slice: &[Log]) {
-        self.logs.extend_from_slice(slice);
-    }
-    pub fn truncate(&mut self, len: usize) {
-        self.logs.truncate(len - self.offset);
-    }
-    pub fn last(&self) -> Option<&Log> {
-        Some(self.logs.last().unwrap())
-    }
-    pub fn trim_start_until(&mut self, idx: usize) {
-        if let Some(delta) = idx.checked_sub(self.offset) {
-            self.offset = idx;
-            self.logs.drain(0..delta.min(self.logs.len()));
-        }
-    }
-    pub fn clear(&mut self) {
-        self.logs.clear();
+
+    pub fn prev_log(&self, index: usize) -> Option<&LogEntry> {
+        self.get(index - 1)
     }
 }
 
-impl Index<usize> for Logs {
-    type Output = Log;
+impl Index<usize> for Log {
+    type Output = LogEntry;
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index).unwrap_or_else(|| {
             panic!(
@@ -63,10 +49,10 @@ impl Index<usize> for Logs {
     }
 }
 
-impl Index<RangeFrom<usize>> for Logs {
-    type Output = [Log];
+impl Index<RangeFrom<usize>> for Log {
+    type Output = [LogEntry];
     fn index(&self, range: RangeFrom<usize>) -> &Self::Output {
         let start = range.start.checked_sub(self.offset).expect("out of range");
-        &self.logs[start..]
+        &self.entries[start..]
     }
 }

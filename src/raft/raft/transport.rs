@@ -77,12 +77,17 @@ pub mod testing {
     pub struct MockTransport {
         tx: mpsc::UnboundedSender<Box<dyn Any + Send>>,
         rx: mpsc::UnboundedReceiver<Box<dyn Any + Send>>,
+        last_request: Option<Box<dyn Any + Send>>,
     }
 
     impl MockTransport {
         pub fn new() -> Self {
             let (tx, rx) = mpsc::unbounded();
-            Self { tx, rx }
+            Self {
+                tx,
+                rx,
+                last_request: None,
+            }
         }
 
         pub async fn respond<R: Request>(&self, response: R::Response) {
@@ -90,14 +95,22 @@ pub mod testing {
                 .unbounded_send(Box::new(response))
                 .expect("Failed to send response");
         }
+
+        pub fn last_request<R: Request>(&self) -> Option<&R> {
+            self.last_request
+                .as_ref()
+                .and_then(|req| req.downcast_ref::<R>())
+        }
     }
 
     impl Transport for MockTransport {
         async fn call<R: Request>(
             &mut self,
             _dst: SocketAddr,
-            _request: R,
+            request: R,
         ) -> std::io::Result<R::Response> {
+            self.last_request = Some(Box::new(request));
+
             let response = self.rx.next().await;
             match response {
                 Some(rsp) => Ok(*rsp
