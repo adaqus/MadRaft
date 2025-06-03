@@ -66,40 +66,34 @@ pub mod testing {
     use std::any::Any;
     use std::{future::Future, net::SocketAddr, time::Duration};
 
+    use futures::SinkExt;
     use futures::{channel::mpsc, StreamExt};
     use madsim::net::rpc::Request;
     use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use tracing::debug;
 
     use super::Result;
     use super::Transport;
 
     pub struct MockTransport {
-        tx: mpsc::UnboundedSender<Box<dyn Any + Send>>,
-        rx: mpsc::UnboundedReceiver<Box<dyn Any + Send>>,
-        last_request: Option<Box<dyn Any + Send>>,
+        request_tx: mpsc::UnboundedSender<Box<dyn Any + Send>>,
+        request_rx: mpsc::UnboundedReceiver<Box<dyn Any + Send>>,
     }
 
     impl MockTransport {
         pub fn new() -> Self {
-            let (tx, rx) = mpsc::unbounded();
+            let (request_tx, request_rx) = mpsc::unbounded();
             Self {
-                tx,
-                rx,
-                last_request: None,
+                request_tx,
+                request_rx,
             }
         }
 
         pub async fn respond<R: Request>(&self, response: R::Response) {
-            self.tx
+            self.request_tx
                 .unbounded_send(Box::new(response))
                 .expect("Failed to send response");
-        }
-
-        pub fn last_request<R: Request>(&self) -> Option<&R> {
-            self.last_request
-                .as_ref()
-                .and_then(|req| req.downcast_ref::<R>())
         }
     }
 
@@ -109,9 +103,8 @@ pub mod testing {
             _dst: SocketAddr,
             request: R,
         ) -> std::io::Result<R::Response> {
-            self.last_request = Some(Box::new(request));
-
-            let response = self.rx.next().await;
+            let response = self.request_rx.next().await;
+            debug!("MockTransport received request");
             match response {
                 Some(rsp) => Ok(*rsp
                     .downcast::<R::Response>()

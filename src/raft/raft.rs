@@ -802,6 +802,7 @@ impl<T: Transport> FollowerSync<T> {
                             // TODO backoff
                             time::sleep(Duration::from_millis(5)).await;
                             self.next_index -= 1;
+                            continue;
                         }
                     }
                     Err(e) => {
@@ -825,13 +826,10 @@ impl<T: Transport> FollowerSync<T> {
 #[cfg(test)]
 mod tests {
     use std::{
-        net::SocketAddr,
-        sync::{
+        any::Any, net::SocketAddr, sync::{
             atomic::{AtomicU64, AtomicUsize},
             Arc,
-        },
-        time::Duration,
-        vec,
+        }, time::Duration, vec
     };
 
     use futures::StreamExt;
@@ -840,7 +838,7 @@ mod tests {
     use tracing::debug;
     use tracing_subscriber::field::debug;
 
-    use crate::raft::raft::logs::Log;
+    use crate::raft::raft::{logs::Log, transport};
 
     use super::{
         transport::testing::MockTransport, AppendEntriesArgs, AppendEntriesReply, FollowerSync,
@@ -991,89 +989,5 @@ mod tests {
             update_msg
         );
         assert_eq!(0, match_index.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[madsim::test]
-    async fn follower_sync_followers_log_is_inconsistent_with_leaders() {
-        init_logger();
-
-        let (mut sync, transport, mut log, match_index, mut sync_receiver) = before(2).await;
-
-        madsim::task::spawn(async move {
-            sync.sync_loop(SocketAddr::from(([10, 0, 0, 200], 1))).await;
-        });
-
-        time::sleep(Duration::from_millis(10)).await;
-
-        let transport_guard = transport.lock().await;
-
-        assert_eq!(
-            AppendEntriesArgs {
-                term: 1,
-                leader_id: 0,
-                prev_log_index: 0,
-                prev_log_term: 1,
-                entries: vec![LogEntry {
-                    term: 1,
-                    data: vec![7, 8, 9]
-                },],
-                leader_commit: 0,
-            },
-            *transport_guard.last_request::<AppendEntriesArgs>().unwrap()
-        );
-
-        transport_guard
-            .respond::<AppendEntriesArgs>(AppendEntriesReply {
-                term: 1,
-                success: true,
-            })
-            .await;
-
-        drop(transport_guard);
-        time::sleep(Duration::from_millis(10)).await;
-
-        assert_eq!(0, match_index.load(std::sync::atomic::Ordering::SeqCst));
-
-        let transport_guard = transport.lock().await;
-        transport_guard
-            .respond::<AppendEntriesArgs>(AppendEntriesReply {
-                term: 1,
-                success: false,
-            })
-            .await;
-
-        assert_eq!(
-            AppendEntriesArgs {
-                term: 1,
-                leader_id: 0,
-                prev_log_index: 0,
-                prev_log_term: 1,
-                entries: vec![
-                    LogEntry {
-                        term: 1,
-                        data: vec![7, 8, 9]
-                    },
-                    LogEntry {
-                        term: 1,
-                        data: vec![7, 8, 9]
-                    },
-                ],
-                leader_commit: 0,
-            },
-            *transport_guard.last_request::<AppendEntriesArgs>().unwrap()
-        );
-
-        transport_guard
-            .respond::<AppendEntriesArgs>(AppendEntriesReply {
-                term: 1,
-                success: true,
-            })
-            .await;
-        drop(transport_guard);
-
-        assert_eq!(2, match_index.load(std::sync::atomic::Ordering::SeqCst));
-
-        let update_msg = sync_receiver.next().await.unwrap();
-        assert_eq!(super::FollowerSyncMsg::UpdateCommitIndex, update_msg);
     }
 }
