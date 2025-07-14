@@ -132,10 +132,11 @@ impl RaftHandle {
             ep: ep.clone(),
             apply_ch,
             state: State::default(),
-            this: Weak::new(),
+            weak_ref: Weak::new(),
             pending_election: None,
             heartbeat_task: None,
             commit_index: Arc::new(AtomicU64::new(0)),
+            follower_sync_tasks: Vec::new(),
         }));
 
         let handle = RaftHandle {
@@ -145,7 +146,7 @@ impl RaftHandle {
 
         {
             let mut raft = handle.inner.lock().unwrap();
-            raft.this = Arc::downgrade(&handle.inner);
+            raft.weak_ref = Arc::downgrade(&handle.inner);
         }
 
         // initialize from state persisted before a crash
@@ -189,7 +190,14 @@ impl RaftHandle {
                                 debug!("{:?}: Heartbeat received (t={term}), reset election timeout.", raft_guard);
                                 // If we receive a heartbeat here, it means we can safely set following state
                                 raft_guard.pending_election.take().map(|e| e.abort());
+                                // If we are a follower, we can reset the heartbeat task
                                 raft_guard.heartbeat_task.take().map(|h| h.abort());
+                                // If we are a follower, we do not sync with followers
+                                raft_guard.follower_sync_tasks.iter_mut().for_each(|task| {
+                                    task.abort();
+                                });
+                                raft_guard.follower_sync_tasks.clear();
+
                                 trace!("Old state: {:?}", raft_guard.state);
                                 raft_guard.state.role = Role::Follower;
                                 if term > raft_guard.state.current_term {
@@ -361,6 +369,17 @@ impl RaftHandle {
     }
 }
 
+/// State of a raft peer.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+struct State {
+    current_term: u64,
+    role: Role,
+    last_log_index: usize, // TODO take from logs
+    last_log_term: usize,  // TODO take from logs
+    voted_for: Option<usize>,
+    log: Vec<LogEntry>,
+}
+
 struct Raft {
     peers: Vec<SocketAddr>,
     me: usize,
@@ -378,20 +397,10 @@ struct Raft {
     commit_index: Arc<AtomicU64>,
 
     // Self-reference to use in async tasks
-    this: Weak<Mutex<Self>>,
+    weak_ref: Weak<Mutex<Self>>,
     pending_election: Option<JoinHandle<()>>,
     heartbeat_task: Option<JoinHandle<()>>,
-}
-
-/// State of a raft peer.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
-struct State {
-    current_term: u64,
-    role: Role,
-    last_log_index: usize, // TODO take from logs
-    last_log_term: usize,  // TODO take from logs
-    voted_for: Option<usize>,
-    log: Vec<LogEntry>,
+    follower_sync_tasks: Vec<JoinHandle<()>>,
 }
 
 // HINT: put mutable non-async functions here
@@ -559,7 +568,7 @@ impl Raft {
             .fuse(),
         );
 
-        let this = self.this.clone();
+        let raft_ref = self.weak_ref.clone();
 
         self.pending_election = Some(madsim::task::spawn(async move {
             futures::select_biased! {
@@ -567,19 +576,20 @@ impl Raft {
                     warn!("Raft({me}): election timed out ({timeout:?}), waiting for another one");
                 },
                 result = election => {
-                    let that = match this.upgrade() {
+                    let raft = match raft_ref.upgrade() {
                         Some(raft) => raft,
                         None => {
                             warn!("Raft({me}): Election: Raft instance is gone");
                             return;
                         }
                     };
-                    let mut that = that.lock().unwrap();
+                    let mut raft_guard = raft.lock().unwrap();
                     match result {
-                        VotingResult::Outdated { peer_term } => that.change_state(Role::Follower, peer_term),
+                        VotingResult::Outdated { peer_term } => raft_guard.change_state(Role::Follower, peer_term),
                         VotingResult::Won => {
-                            that.change_state(Role::Leader, current_term);
-                            that.start_heartbeat_task();
+                            raft_guard.change_state(Role::Leader, current_term);
+                            raft_guard.start_heartbeat_task();
+                            raft_guard.start_follower_sync_tasks();
                         },
                         VotingResult::NoQuorum => info!("Raft({me}): no quorum, staying a candidate")
                     }
@@ -601,7 +611,7 @@ impl Raft {
         assert!(self.state.is_leader());
 
         let me = self.me;
-        let this = self.this.clone();
+        let this = self.weak_ref.clone();
 
         self.heartbeat_task = Some(madsim::task::spawn(async move {
             trace!("Raft({me}): starting heartbeat task");
@@ -644,6 +654,65 @@ impl Raft {
                 time::sleep(Duration::from_millis(50)).await;
             }
         }));
+    }
+
+    fn start_follower_sync_tasks(&mut self) {
+        assert!(self.state.is_leader());
+
+        let me = self.me;
+        let weak_ref = self.weak_ref.clone();
+        let peers = self.peers.clone();
+        let commit_index = self.commit_index.clone();
+        let current_term = self.state.current_term;
+
+        // Create a Vec to store the follower sync task handles
+        let mut follower_sync_tasks = Vec::new();
+
+        for (i, &peer) in peers.iter().enumerate() {
+            if i == me {
+                continue;
+            }
+
+            let (sync_sender, mut sync_receiver) = mpsc::unbounded::<FollowerSyncMsg>();
+            let peer_weak_ref = weak_ref.clone();
+            let peer_commit_index = commit_index.clone();
+
+            // Create a transport for this peer
+            let transport = Arc::new(AsyncMutex::new(transport::MadsimTransport::new(
+                self.ep.clone(),
+            )));
+
+            // Create a match index tracker for this peer
+            let match_index = Arc::new(AtomicUsize::new(0));
+
+            // Get log reference
+            let log = Arc::new(AsyncMutex::new(Log::new())); // TODO: Replace with actual log reference
+
+            // Start with next_index just after the last entry in the log
+            let next_index = self.state.last_log_index + 1;
+
+            // Create a follower sync instance
+            let mut follower_sync = FollowerSync::new(
+                peer_commit_index,
+                transport.clone(),
+                log.clone(),
+                next_index,
+                match_index.clone(),
+                me as u64,
+                current_term,
+                sync_sender,
+            );
+
+            // Spawn a task to run the sync loop
+            let sync_task = madsim::task::spawn(async move {
+                follower_sync.sync_loop(peer).await;
+            });
+
+            // Store the task handles
+            follower_sync_tasks.push(sync_task);
+        }
+
+        self.follower_sync_tasks = follower_sync_tasks;
     }
 }
 
@@ -826,10 +895,14 @@ impl<T: Transport> FollowerSync<T> {
 #[cfg(test)]
 mod tests {
     use std::{
-        any::Any, net::SocketAddr, sync::{
+        any::Any,
+        net::SocketAddr,
+        sync::{
             atomic::{AtomicU64, AtomicUsize},
             Arc,
-        }, time::Duration, vec
+        },
+        time::Duration,
+        vec,
     };
 
     use futures::StreamExt;
