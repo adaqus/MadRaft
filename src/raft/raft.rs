@@ -23,7 +23,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex, Weak,
     },
 };
@@ -43,7 +43,7 @@ pub struct RaftHandle {
 
 type MsgSender = mpsc::UnboundedSender<ApplyMsg>;
 pub type MsgRecver = mpsc::UnboundedReceiver<ApplyMsg>;
-type Term = u64;
+type Term = usize;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -51,22 +51,22 @@ type Term = u64;
 pub enum ApplyMsg {
     Command {
         data: Vec<u8>,
-        index: u64,
+        index: usize,
     },
     // For 2D:
     Snapshot {
         data: Vec<u8>,
-        term: u64,
-        index: u64,
+        term: usize,
+        index: usize,
     },
 }
 
 #[derive(Debug)]
 pub struct Start {
     /// The index that the command will appear at if it's ever committed.
-    pub index: u64,
+    pub index: usize,
     /// The current term.
-    pub term: u64,
+    pub term: usize,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -74,7 +74,7 @@ pub enum Error {
     #[error("This node is not a leader, next leader: {0}")]
     NotLeader(usize),
     #[error("Outdated leader term, current: {current}, peer's: {peer}")]
-    OutdatedTerm { current: u64, peer: u64 },
+    OutdatedTerm { current: usize, peer: usize },
     #[error("IO error")]
     IO(#[from] io::Error),
     #[error("Shutdown pending")]
@@ -105,7 +105,7 @@ impl State {
 /// Data needs to be persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Persist {
-    current_term: u64,
+    current_term: usize,
     voted_for: Option<usize>,
 }
 
@@ -125,6 +125,7 @@ impl RaftHandle {
         let (apply_ch, recver) = mpsc::unbounded();
         let (heartbeat_sender, mut heartbeat_receiver) = mpsc::unbounded();
         trace!("Binding node {} to {}", me + 1, peers[me]);
+        let peers_len = peers.len();
         let ep = Arc::new(Endpoint::bind(peers[me]).await.expect("failed to bind"));
         let inner = Arc::new(Mutex::new(Raft {
             peers,
@@ -132,11 +133,13 @@ impl RaftHandle {
             ep: ep.clone(),
             apply_ch,
             state: State::default(),
-            weak_ref: Weak::new(),
+            self_weak_ref: Weak::new(),
             pending_election: None,
             heartbeat_task: None,
-            commit_index: Arc::new(AtomicU64::new(0)),
+            commit_index: Arc::new(AtomicUsize::new(0)),
+            match_index: vec![0; peers_len],
             follower_sync_tasks: Vec::new(),
+            commit_index_tasks: Vec::new(),
         }));
 
         let handle = RaftHandle {
@@ -146,7 +149,7 @@ impl RaftHandle {
 
         {
             let mut raft = handle.inner.lock().unwrap();
-            raft.weak_ref = Arc::downgrade(&handle.inner);
+            raft.self_weak_ref = Arc::downgrade(&handle.inner);
         }
 
         // initialize from state persisted before a crash
@@ -229,7 +232,7 @@ impl RaftHandle {
     }
 
     /// The current term of this peer.
-    pub fn term(&self) -> u64 {
+    pub fn term(&self) -> usize {
         let raft = self.inner.lock().unwrap();
         raft.state.current_term
     }
@@ -252,8 +255,8 @@ impl RaftHandle {
     /// the snapshot on `apply_ch`.
     pub async fn cond_install_snapshot(
         &self,
-        _last_included_term: u64,
-        _last_included_index: u64,
+        _last_included_term: usize,
+        _last_included_index: usize,
         _snapshot: &[u8],
     ) -> bool {
         todo!()
@@ -263,7 +266,7 @@ impl RaftHandle {
     /// including index. This means the service no longer needs the log through
     /// (and including) that index. Raft should now trim its log as much as
     /// possible.
-    pub async fn snapshot(&self, index: u64, snapshot: &[u8]) -> Result<()> {
+    pub async fn snapshot(&self, index: usize, snapshot: &[u8]) -> Result<()> {
         todo!()
     }
 
@@ -372,12 +375,12 @@ impl RaftHandle {
 /// State of a raft peer.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 struct State {
-    current_term: u64,
+    current_term: usize,
     role: Role,
     last_log_index: usize, // TODO take from logs
     last_log_term: usize,  // TODO take from logs
     voted_for: Option<usize>,
-    log: Vec<LogEntry>,
+    log: Log,
 }
 
 struct Raft {
@@ -394,23 +397,38 @@ struct Raft {
     // state a Raft server must maintain.
     state: State,
 
-    commit_index: Arc<AtomicU64>,
+    commit_index: Arc<AtomicUsize>,
+
+    // match index for each peer
+    match_index: Vec<usize>,
 
     // Self-reference to use in async tasks
-    weak_ref: Weak<Mutex<Self>>,
+    self_weak_ref: Weak<Mutex<Self>>,
     pending_election: Option<JoinHandle<()>>,
     heartbeat_task: Option<JoinHandle<()>>,
     follower_sync_tasks: Vec<JoinHandle<()>>,
+    commit_index_tasks: Vec<JoinHandle<()>>,
 }
 
 // HINT: put mutable non-async functions here
 impl Raft {
-    fn start(&mut self, _data: &[u8]) -> Result<Start> {
+    fn start(&mut self, data: &[u8]) -> Result<Start> {
         if !self.state.is_leader() {
             let leader = (self.me + 1) % self.peers.len();
             return Err(Error::NotLeader(leader));
         }
-        todo!("start agreement");
+
+        let log_index = self.state.log.push(LogEntry {
+            term: self.state.current_term as usize,
+            data: data.to_vec(),
+        });
+
+        self.match_index[self.me] = log_index; // Update match index for self
+
+        Ok(Start {
+            index: log_index as usize,
+            term: self.state.current_term,
+        })
     }
 
     // Here is an example to apply committed message.
@@ -527,7 +545,7 @@ impl Raft {
         let current_term = self.state.current_term;
 
         enum VotingResult {
-            Outdated { peer_term: u64 },
+            Outdated { peer_term: usize },
             Won,
             NoQuorum,
         }
@@ -568,7 +586,7 @@ impl Raft {
             .fuse(),
         );
 
-        let raft_ref = self.weak_ref.clone();
+        let raft_ref = self.self_weak_ref.clone();
 
         self.pending_election = Some(madsim::task::spawn(async move {
             futures::select_biased! {
@@ -598,20 +616,24 @@ impl Raft {
         }));
     }
 
-    fn change_state(&mut self, role: Role, term: u64) {
+    fn change_state(&mut self, role: Role, term: usize) {
         info!("Raft({}): changing state to {role:?}, term {term}", self.me);
         self.state.role = role;
         self.state.current_term = term;
         self.state.voted_for = None;
         self.pending_election.take().map(|e| e.abort());
         self.heartbeat_task.take().map(|h| h.abort());
+        self.follower_sync_tasks.iter_mut().for_each(|f| f.abort());
+        self.follower_sync_tasks.clear();
+        self.commit_index_tasks.iter_mut().for_each(|c| c.abort());
+        self.commit_index_tasks.clear();
     }
 
     fn start_heartbeat_task(&mut self) {
         assert!(self.state.is_leader());
 
         let me = self.me;
-        let this = self.weak_ref.clone();
+        let this = self.self_weak_ref.clone();
 
         self.heartbeat_task = Some(madsim::task::spawn(async move {
             trace!("Raft({me}): starting heartbeat task");
@@ -628,7 +650,7 @@ impl Raft {
                     (
                         AppendEntriesArgs {
                             term: that.state.current_term,
-                            leader_id: that.me as u64,
+                            leader_id: that.me as usize,
                             prev_log_index: that.state.last_log_index,
                             prev_log_term: that.state.last_log_term,
                             entries: vec![],
@@ -660,13 +682,14 @@ impl Raft {
         assert!(self.state.is_leader());
 
         let me = self.me;
-        let weak_ref = self.weak_ref.clone();
+        let self_weak_ref = self.self_weak_ref.clone();
         let peers = self.peers.clone();
         let commit_index = self.commit_index.clone();
         let current_term = self.state.current_term;
 
         // Create a Vec to store the follower sync task handles
         let mut follower_sync_tasks = Vec::new();
+        let mut commit_index_tasks = Vec::new();
 
         for (i, &peer) in peers.iter().enumerate() {
             if i == me {
@@ -674,8 +697,8 @@ impl Raft {
             }
 
             let (sync_sender, mut sync_receiver) = mpsc::unbounded::<FollowerSyncMsg>();
-            let peer_weak_ref = weak_ref.clone();
-            let peer_commit_index = commit_index.clone();
+            let self_weak_ref_clone = self_weak_ref.clone();
+            let leader_commit_index = commit_index.clone();
 
             // Create a transport for this peer
             let transport = Arc::new(AsyncMutex::new(transport::MadsimTransport::new(
@@ -693,33 +716,102 @@ impl Raft {
 
             // Create a follower sync instance
             let mut follower_sync = FollowerSync::new(
-                peer_commit_index,
+                leader_commit_index,
                 transport.clone(),
                 log.clone(),
                 next_index,
                 match_index.clone(),
-                me as u64,
+                me as usize,
                 current_term,
                 sync_sender,
             );
 
             // Spawn a task to run the sync loop
             let sync_task = madsim::task::spawn(async move {
-                follower_sync.sync_loop(peer).await;
+                follower_sync.sync_loop(peer, i).await;
             });
 
             // Store the task handles
             follower_sync_tasks.push(sync_task);
+
+            // Create a commit index update task
+            let commit_index_task = madsim::task::spawn(async move {
+                while let Some(msg) = sync_receiver.next().await {
+                    match msg {
+                        FollowerSyncMsg::OutdatedTerm { peer_term, peer } => {
+                            if let Some(raft) = self_weak_ref_clone.upgrade() {
+                                let mut raft_guard = raft.lock().unwrap();
+                                if peer_term < raft_guard.state.current_term {
+                                    warn!(
+                                        "Raft({}): Outdated term from peer {}, current term: {}, peer term: {}",
+                                        me, peer, raft_guard.state.current_term, peer_term
+                                    );
+                                    raft_guard.change_state(Role::Follower, peer_term);
+                                }
+                            }
+                        }
+                        FollowerSyncMsg::UpdateCommitIndex { index, peer } => {
+                            if let Some(raft) = self_weak_ref_clone.upgrade() {
+                                let mut raft_guard = raft.lock().unwrap();
+                                debug!(
+                                    "Raft({}): Updating commit index to {} from peer {}",
+                                    me, index, peer
+                                );
+                                raft_guard.match_index[peer] = index;
+                                raft_guard.update_commit_index();
+                            }
+                        }
+                    }
+                }
+            });
+
+            commit_index_tasks.push(commit_index_task);
         }
 
         self.follower_sync_tasks = follower_sync_tasks;
+        self.commit_index_tasks = commit_index_tasks;
+    }
+
+    fn update_commit_index(&mut self) {
+        // Check if there exists an N such that N > commitIndex, a majority
+        // of matchIndex[i] ≥ N, and log[N].term == currentTerm
+
+        let current_commit_index = self.commit_index.load(Ordering::SeqCst);
+
+        // Sort the match indices in descending order
+        let mut match_indices = self.match_index.clone();
+        match_indices.sort_unstable();
+
+        // Find the log index that a majority of servers have replicated (median of match indices)
+        let majority = (self.peers.len() + 1) / 2;
+        let majority_match_index = match_indices[majority - 1];
+
+        // Only update if the majority match index is greater than our current commit index
+        if majority_match_index > current_commit_index {
+            // Only commit entries from the current term
+            let term_at_index = self
+                .state
+                .log
+                .get(majority_match_index)
+                .map(|entry| entry.term)
+                .unwrap_or(0);
+
+            if term_at_index == self.state.current_term as usize {
+                debug!(
+                    "Raft({}): Updating commit index from {} to {}",
+                    self.me, current_commit_index, majority_match_index
+                );
+                self.commit_index
+                    .store(majority_match_index, Ordering::SeqCst);
+            }
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
 #[rtype("RequestVoteReply")]
 struct RequestVoteArgs {
-    term: u64,
+    term: usize,
     candidate_id: usize,
     last_log_index: usize,
     last_log_term: usize,
@@ -727,7 +819,7 @@ struct RequestVoteArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestVoteReply {
-    term: u64,
+    term: usize,
     vote_granted: bool,
 }
 
@@ -741,12 +833,12 @@ enum RequestVoteResult {
 #[derive(Debug, Clone, Serialize, Deserialize, Request, PartialEq)]
 #[rtype("AppendEntriesReply")]
 pub struct AppendEntriesArgs {
-    pub term: u64,
-    pub leader_id: u64,
+    pub term: usize,
+    pub leader_id: usize,
     pub prev_log_index: usize,
     pub prev_log_term: usize,
     pub entries: Vec<LogEntry>,
-    pub leader_commit: u64,
+    pub leader_commit: usize,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -757,40 +849,40 @@ pub struct LogEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesReply {
-    pub term: u64,
+    pub term: usize,
     pub success: bool,
 }
 
 #[derive(Debug, PartialEq)]
 enum FollowerSyncMsg {
-    OutdatedTerm { current: u64, peer: u64 },
-    UpdateCommitIndex,
+    OutdatedTerm { peer_term: usize, peer: usize },
+    UpdateCommitIndex { index: usize, peer: usize },
 }
 
 pub struct FollowerSync<T: Transport> {
-    commit_index: Arc<AtomicU64>,
+    leader_commit_index: Arc<AtomicUsize>,
     next_index: usize,
     match_index: Arc<AtomicUsize>,
     transport: Arc<AsyncMutex<T>>,
     log: Arc<AsyncMutex<Log>>,
-    leader_id: u64,
-    leader_term: u64,
+    leader_id: usize,
+    leader_term: usize,
     sync_sender: mpsc::UnboundedSender<FollowerSyncMsg>,
 }
 
 impl<T: Transport> FollowerSync<T> {
     pub fn new(
-        commit_index: Arc<AtomicU64>,
+        leader_commit_index: Arc<AtomicUsize>,
         transport: Arc<AsyncMutex<T>>,
         log: Arc<AsyncMutex<Log>>,
         next_index: usize,
         match_index: Arc<AtomicUsize>,
-        leader_id: u64,
-        leader_term: u64,
+        leader_id: usize,
+        leader_term: usize,
         sync_sender: mpsc::UnboundedSender<FollowerSyncMsg>,
     ) -> Self {
         Self {
-            commit_index,
+            leader_commit_index,
             transport,
             log,
             next_index,
@@ -801,7 +893,7 @@ impl<T: Transport> FollowerSync<T> {
         }
     }
 
-    pub async fn sync_loop(&mut self, peer: SocketAddr) {
+    pub async fn sync_loop(&mut self, peer_addr: SocketAddr, peer_number: usize) {
         loop {
             // debug!("FollowerSync loop");
             let log = self.log.lock().await;
@@ -820,7 +912,7 @@ impl<T: Transport> FollowerSync<T> {
             );
 
             if entries_len > 0 {
-                debug!("Send {} entries to peer {}", entries.len(), peer);
+                debug!("Send {} entries to peer {}", entries.len(), peer_addr);
 
                 let args = AppendEntriesArgs {
                     term: self.leader_term,
@@ -828,25 +920,25 @@ impl<T: Transport> FollowerSync<T> {
                     prev_log_index: self.next_index - 1,
                     prev_log_term,
                     entries,
-                    leader_commit: self.commit_index.load(Ordering::SeqCst),
+                    leader_commit: self.leader_commit_index.load(Ordering::SeqCst),
                 };
 
                 let reply = {
                     let mut transport = self.transport.lock().await;
                     transport
-                        .call_timeout(peer, args, Duration::from_secs(5))
+                        .call_timeout(peer_addr, args, Duration::from_secs(5))
                         .await
                 };
 
-                debug!("Received reply from peer {}: {:?}", peer, reply);
+                debug!("Received reply from peer {}: {:?}", peer_addr, reply);
 
                 match reply {
                     Ok(reply) => {
                         if reply.term > self.leader_term {
-                            debug!("Peer {} has higher term, aborting sync", peer);
+                            debug!("Peer {} has higher term, aborting sync", peer_addr);
                             self.sync_sender
                                 .send(FollowerSyncMsg::OutdatedTerm {
-                                    current: self.leader_term,
+                                    peer_term: self.leader_term,
                                     peer: reply.term,
                                 })
                                 .await
@@ -855,18 +947,21 @@ impl<T: Transport> FollowerSync<T> {
                         }
 
                         if reply.success {
-                            debug!("Peer {} accepted {} entries", peer, entries_len);
+                            debug!("Peer {} accepted {} entries", peer_addr, entries_len);
                             self.match_index.store(new_match_index, Ordering::Relaxed);
                             self.next_index = new_match_index + 1;
                             self.sync_sender
-                                .send(FollowerSyncMsg::UpdateCommitIndex)
+                                .send(FollowerSyncMsg::UpdateCommitIndex {
+                                    index: new_match_index,
+                                    peer: peer_number,
+                                })
                                 .await
                                 .expect("Failed to send update commit index message");
                             debug!("Sent update commit index message to sync channel");
                         } else {
                             debug!(
                                 "Peer {} rejected {} entries, retrying from earlier entry",
-                                peer, entries_len
+                                peer_addr, entries_len
                             );
                             // TODO backoff
                             time::sleep(Duration::from_millis(5)).await;
@@ -877,7 +972,7 @@ impl<T: Transport> FollowerSync<T> {
                     Err(e) => {
                         warn!(
                             "Failed to send AppendEntries to peer {}: {:?}, retrying",
-                            peer, e
+                            peer_addr, e
                         );
                         // TODO backoff
                         time::sleep(Duration::from_millis(10)).await;
@@ -898,7 +993,7 @@ mod tests {
         any::Any,
         net::SocketAddr,
         sync::{
-            atomic::{AtomicU64, AtomicUsize},
+            atomic::{AtomicUsize, AtomicUsize},
             Arc,
         },
         time::Duration,
@@ -948,7 +1043,7 @@ mod tests {
 
         let transport = Arc::new(AsyncMutex::new(MockTransport::new()));
         let mut log = Arc::new(AsyncMutex::new(log_inner));
-        let commit_index = Arc::new(AtomicU64::new(0));
+        let commit_index = Arc::new(AtomicUsize::new(0));
         let next_index = log.lock().await.len();
         let match_index = Arc::new(AtomicUsize::new(0));
         let leader_id = 0;
@@ -975,7 +1070,8 @@ mod tests {
         let (mut sync, transport, mut log, match_index, mut sync_receiver) = before(1).await;
 
         madsim::task::spawn(async move {
-            sync.sync_loop(SocketAddr::from(([10, 0, 0, 200], 1))).await;
+            sync.sync_loop(SocketAddr::from(([10, 0, 0, 200], 1)), 0)
+                .await;
         });
 
         let transport_guard = transport.lock().await;
@@ -1041,7 +1137,8 @@ mod tests {
         let (mut sync, transport, mut log, match_index, mut sync_receiver) = before(1).await;
 
         madsim::task::spawn(async move {
-            sync.sync_loop(SocketAddr::from(([10, 0, 0, 200], 1))).await;
+            sync.sync_loop(SocketAddr::from(([10, 0, 0, 200], 1)), 0)
+                .await;
         });
 
         let transport_guard = transport.lock().await;
@@ -1056,7 +1153,7 @@ mod tests {
         let update_msg = sync_receiver.next().await.unwrap();
         assert_eq!(
             super::FollowerSyncMsg::OutdatedTerm {
-                current: 1,
+                peer_term: 1,
                 peer: 2
             },
             update_msg

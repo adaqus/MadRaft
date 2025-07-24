@@ -2,10 +2,18 @@ use super::LogEntry;
 use serde::{Deserialize, Serialize};
 use std::ops::{Index, RangeFrom};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub type LogIndex = usize;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Log {
     offset: usize,
     entries: Vec<LogEntry>,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Log::new()
+    }
 }
 
 impl Log {
@@ -26,8 +34,10 @@ impl Log {
             .and_then(|i| self.entries.get(i))
     }
 
-    pub fn push(&mut self, log: LogEntry) {
+    pub fn push(&mut self, log: LogEntry) -> LogIndex {
         self.entries.push(log);
+        self.offset += 1;
+        self.offset
     }
 
     pub fn prev_log(&self, index: usize) -> Option<&LogEntry> {

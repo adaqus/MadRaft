@@ -1,6 +1,6 @@
 use super::Result;
 use madsim::net::{rpc::Request, Endpoint};
-use std::{future::Future, net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 pub trait Transport {
     /// Call function on a remote host.
@@ -25,11 +25,11 @@ pub trait Transport {
 }
 
 pub struct MadsimTransport {
-    endpoint: Endpoint,
+    endpoint: Arc<Endpoint>,
 }
 
 impl MadsimTransport {
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub fn new(endpoint: Arc<Endpoint>) -> Self {
         Self { endpoint }
     }
 }
