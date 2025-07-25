@@ -278,7 +278,7 @@ async fn concurrent_starts_2b() {
             }
         }
         for ii in 0..5 {
-            let x: u64 = 100 + ii;
+            let x: usize = 100 + ii;
             let ok = cmds.iter().find(|&&cmd| cmd == x).is_some();
             assert!(ok, "cmd {} missing in {:?}", x, cmds);
         }
@@ -440,7 +440,7 @@ async fn count_2b() {
 
         let mut cmds = vec![];
         for i in 1..iters + 2 {
-            let x = random.gen::<u64>();
+            let x = random.gen::<usize>();
             cmds.push(x);
             match t.start(leader, Entry { x }).await {
                 Ok(s) => {
@@ -475,7 +475,7 @@ async fn count_2b() {
             continue 'outer;
         }
         total2 = t.rpc_total();
-        if total2 - total1 > (iters as u64 + 1 + 3) * 3 {
+        if total2 - total1 > (iters as usize + 1 + 3) * 3 {
             panic!("too many RPCs ({}) for {} entries", total2 - total1, iters);
         }
 
@@ -777,7 +777,12 @@ async fn internal_churn(unreliable: bool) {
     let stop = Arc::new(AtomicBool::new(false));
 
     // create concurrent clients
-    async fn cfn(servers: usize, me: usize, stop: Arc<AtomicBool>, t: Arc<RaftTester>) -> Vec<u64> {
+    async fn cfn(
+        servers: usize,
+        me: usize,
+        stop: Arc<AtomicBool>,
+        t: Arc<RaftTester>,
+    ) -> Vec<usize> {
         let mut values = vec![];
         let mut random = rand::thread_rng();
         while !stop.load(Ordering::SeqCst) {

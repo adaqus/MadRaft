@@ -34,7 +34,7 @@ pub struct RaftTester {
     t0: Instant,
 }
 
-pub const SNAPSHOT_INTERVAL: u64 = 10;
+pub const SNAPSHOT_INTERVAL: usize = 10;
 pub const IP_OFFSET: usize = 10;
 
 impl RaftTester {
@@ -84,7 +84,7 @@ impl RaftTester {
     pub async fn check_one_leader(&self) -> usize {
         debug!("check_one_leader");
         let mut random = rand::thread_rng();
-        let mut leaders = HashMap::<u64, Vec<usize>>::new();
+        let mut leaders = HashMap::<usize, Vec<usize>>::new();
         for _iters in 0..10 {
             time::sleep(Duration::from_millis(random.gen_range(1000..2000))).await;
 
@@ -115,7 +115,7 @@ impl RaftTester {
     }
 
     /// Check that everyone agrees on the term.
-    pub fn check_terms(&self) -> u64 {
+    pub fn check_terms(&self) -> usize {
         let mut term = 0;
         for (i, connected) in self.connected.iter().enumerate() {
             if !connected.load(Ordering::SeqCst) {
@@ -163,12 +163,12 @@ impl RaftTester {
         self.rafts.lock().unwrap()[i].is_some()
     }
 
-    pub fn term(&self, i: usize) -> u64 {
+    pub fn term(&self, i: usize) -> usize {
         self.rafts.lock().unwrap()[i].as_ref().unwrap().term()
     }
 
-    pub fn rpc_total(&self) -> u64 {
-        self.net.stat().msg_count / 2
+    pub fn rpc_total(&self) -> usize {
+        self.net.stat().msg_count as usize / 2
     }
 
     /// Maximum log size across all servers
@@ -181,7 +181,7 @@ impl RaftTester {
     }
 
     /// How many servers think a log entry is committed?
-    pub fn n_committed(&self, index: u64) -> (usize, Option<Entry>) {
+    pub fn n_committed(&self, index: usize) -> (usize, Option<Entry>) {
         self.storage.n_committed(index)
     }
 
@@ -197,7 +197,7 @@ impl RaftTester {
 
     /// wait for at least n servers to commit.
     /// but don't wait forever.
-    pub async fn wait(&self, index: u64, n: usize, start_term: Option<u64>) -> Option<Entry> {
+    pub async fn wait(&self, index: usize, n: usize, start_term: Option<usize>) -> Option<Entry> {
         let mut to = Duration::from_millis(10);
         for _ in 0..30 {
             let (nd, _) = self.n_committed(index);
@@ -238,7 +238,7 @@ impl RaftTester {
     /// times, in case a leader fails just after Start().
     /// if retry==false, calls start() only once, in order
     /// to simplify the early Lab 2B tests.
-    pub async fn one(&self, cmd: Entry, expected_servers: usize, retry: bool) -> u64 {
+    pub async fn one(&self, cmd: Entry, expected_servers: usize, retry: bool) -> usize {
         debug!("one({:?}, {})", cmd, expected_servers);
         let t0 = Instant::now();
         let mut starts = 0;
@@ -391,7 +391,7 @@ impl RaftTester {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    pub x: u64,
+    pub x: usize,
 }
 
 #[derive(Clone)]
@@ -407,7 +407,7 @@ impl StorageHandle {
         }
     }
 
-    fn push_and_check(&self, i: usize, index: u64, entry: Entry) {
+    fn push_and_check(&self, i: usize, index: usize, entry: Entry) {
         let mut logs = self.logs.lock().unwrap();
         for (j, log) in logs.iter().enumerate() {
             if let Some(Some(old)) = log.get(index as usize) {
@@ -427,13 +427,13 @@ impl StorageHandle {
         }
     }
 
-    fn snapshot(&self, i: usize, index: u64) {
+    fn snapshot(&self, i: usize, index: usize) {
         let mut logs = self.logs.lock().unwrap();
         logs[i].resize(index as usize + 1, None);
     }
 
     /// How many servers think a log entry is committed?
-    fn n_committed(&self, index: u64) -> (usize, Option<Entry>) {
+    fn n_committed(&self, index: usize) -> (usize, Option<Entry>) {
         let mut count = 0;
         let mut cmd = None;
         for log in self.logs.lock().unwrap().iter() {

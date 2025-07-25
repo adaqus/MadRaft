@@ -43,6 +43,13 @@ impl Log {
     pub fn prev_log(&self, index: usize) -> Option<&LogEntry> {
         self.get(index - 1)
     }
+
+    // Clear all entries from the log starting from the given index
+    pub fn clear_from(&mut self, index: LogIndex) {
+        if index < self.offset {
+            self.entries.truncate(index - 1);
+        }
+    }
 }
 
 impl Index<usize> for Log {

@@ -18,6 +18,7 @@ use madsim::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::min,
     fmt,
     future::Future,
     io,
@@ -138,6 +139,7 @@ impl RaftHandle {
             heartbeat_task: None,
             commit_index: Arc::new(AtomicUsize::new(0)),
             match_index: vec![0; peers_len],
+            last_applied: 0,
             follower_sync_tasks: Vec::new(),
             commit_index_tasks: Vec::new(),
         }));
@@ -387,7 +389,7 @@ struct Raft {
     peers: Vec<SocketAddr>,
     me: usize,
 
-    // network endpoint
+    // Network endpoint
     ep: Arc<Endpoint>,
 
     apply_ch: MsgSender,
@@ -399,8 +401,11 @@ struct Raft {
 
     commit_index: Arc<AtomicUsize>,
 
-    // match index for each peer
+    // Match index for each peer
     match_index: Vec<usize>,
+
+    // Index of the last log entry applied to the state machine
+    last_applied: usize,
 
     // Self-reference to use in async tasks
     self_weak_ref: Weak<Mutex<Self>>,
@@ -432,12 +437,16 @@ impl Raft {
     }
 
     // Here is an example to apply committed message.
-    fn apply(&self) {
-        let msg = ApplyMsg::Command {
-            data: todo!("apply msg"),
-            index: todo!("apply msg"),
-        };
-        self.apply_ch.unbounded_send(msg).unwrap();
+    fn apply(&mut self) {
+        while self.commit_index.load(Ordering::SeqCst) > self.last_applied {
+            self.last_applied += 1;
+
+            let msg = ApplyMsg::Command {
+                data: self.state.log[self.last_applied].data.clone(),
+                index: self.last_applied,
+            };
+            self.apply_ch.unbounded_send(msg).unwrap();
+        }
     }
 
     fn request_vote_handler(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
@@ -495,20 +504,53 @@ impl Raft {
     }
 
     fn append_entries_handler(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
-        let resp = AppendEntriesReply {
-            term: self.state.current_term,
-            success: if args.term < self.state.current_term {
-                false
+        let resp = if args.term < self.state.current_term {
+            AppendEntriesReply {
+                term: self.state.current_term,
+                success: false,
+            }
+        } else {
+            if self.state.log.get(args.prev_log_index).is_none()
+                || self.state.log[args.prev_log_index].term != args.prev_log_term
+            {
+                // If the log entry at prev_log_index does not match the term, we reject the request
+                AppendEntriesReply {
+                    term: self.state.current_term,
+                    success: false,
+                }
             } else {
-                true
-            },
+                let new_log_index = args.prev_log_index + 1;
+                if self.state.log.get(new_log_index).is_some()
+                    && self.state.log[new_log_index].term != args.prev_log_term
+                {
+                    // If logs are conflicting, replace own log with leader's log
+                    self.state.log.clear_from(new_log_index);
+                }
+
+                args.entries.iter().for_each(|entry| {
+                    self.state.log.push(LogEntry {
+                        term: args.term,
+                        data: entry.data.clone(),
+                    });
+                });
+
+                // Update own commit index
+                if args.leader_commit > self.commit_index.load(Ordering::SeqCst) {
+                    let new_commit_index = min(args.leader_commit, self.state.log.len());
+                    self.commit_index.store(new_commit_index, Ordering::SeqCst);
+                }
+
+                // If the log entry matches, we accept the request
+                AppendEntriesReply {
+                    term: self.state.current_term,
+                    success: true,
+                }
+            }
         };
-        trace!(
-            "{:?}: append entries RPC: {:?}, response: {:?}",
-            self,
-            args,
-            resp
-        );
+
+        // Apply to state machine if new logs are committed
+        self.apply();
+
         resp
     }
 
@@ -654,7 +696,7 @@ impl Raft {
                             prev_log_index: that.state.last_log_index,
                             prev_log_term: that.state.last_log_term,
                             entries: vec![],
-                            leader_commit: 0, // TODO update this value
+                            leader_commit: that.commit_index.load(Ordering::SeqCst),
                         },
                         that.ep.clone(),
                         that.peers.clone(),
@@ -670,6 +712,7 @@ impl Raft {
                     madsim::task::spawn(async move {
                         trace!("Raft({me}): sending heartbeat to peer {}", peer);
                         ep.call(peer, args).await
+                        // TODO react to heartbeat response (e.g. change state to follower if term is outdated)
                     });
                 }
 
@@ -803,6 +846,8 @@ impl Raft {
                 );
                 self.commit_index
                     .store(majority_match_index, Ordering::SeqCst);
+
+                self.apply();
             }
         }
     }
@@ -992,10 +1037,7 @@ mod tests {
     use std::{
         any::Any,
         net::SocketAddr,
-        sync::{
-            atomic::{AtomicUsize, AtomicUsize},
-            Arc,
-        },
+        sync::{atomic::AtomicUsize, Arc},
         time::Duration,
         vec,
     };
@@ -1084,7 +1126,10 @@ mod tests {
         drop(transport_guard);
 
         let update_msg = sync_receiver.next().await.unwrap();
-        assert_eq!(super::FollowerSyncMsg::UpdateCommitIndex, update_msg);
+        assert_eq!(
+            super::FollowerSyncMsg::UpdateCommitIndex { index: 1, peer: 0 },
+            update_msg
+        );
         assert_eq!(1, match_index.load(std::sync::atomic::Ordering::SeqCst));
 
         let mut log_guard = log.lock().await;
@@ -1104,7 +1149,10 @@ mod tests {
         drop(transport_guard);
 
         let update_msg = sync_receiver.next().await.unwrap();
-        assert_eq!(super::FollowerSyncMsg::UpdateCommitIndex, update_msg);
+        assert_eq!(
+            super::FollowerSyncMsg::UpdateCommitIndex { index: 2, peer: 0 },
+            update_msg
+        );
         assert_eq!(2, match_index.load(std::sync::atomic::Ordering::SeqCst));
 
         let mut log_guard = log.lock().await;
@@ -1126,7 +1174,13 @@ mod tests {
         drop(transport_guard);
 
         let update_msg = sync_receiver.next().await.unwrap();
-        assert_eq!(super::FollowerSyncMsg::UpdateCommitIndex, update_msg);
+        assert_eq!(
+            super::FollowerSyncMsg::UpdateCommitIndex {
+                index: 1002,
+                peer: 0
+            },
+            update_msg
+        );
         assert_eq!(1002, match_index.load(std::sync::atomic::Ordering::SeqCst));
     }
 
