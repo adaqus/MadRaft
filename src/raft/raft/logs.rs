@@ -44,6 +44,10 @@ impl Log {
         self.get(index - 1)
     }
 
+    pub fn last_log_term(&self) -> usize {
+        self.entries.last().map(|e| e.term).unwrap_or(0)
+    }
+
     // Clear all entries from the log starting from the given index
     pub fn clear_from(&mut self, index: LogIndex) {
         if index < self.offset {

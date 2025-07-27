@@ -116,7 +116,10 @@ impl fmt::Debug for Raft {
         write!(
             f,
             "Raft({},t={},lt={},li={})",
-            self.me, self.state.current_term, self.state.last_log_term, self.state.last_log_index
+            self.me,
+            self.state.current_term,
+            self.state.log.last_log_term(),
+            self.state.log.len()
         )
     }
 }
@@ -358,7 +361,7 @@ impl RaftHandle {
             {
                 let mut this = self.inner.lock().unwrap();
                 trace!(
-                    "{:?}: Heartbeat successful, updating term to {}",
+                    "{:?}: AppendEntries/heartbeat successful, updating term to {}",
                     *this,
                     leader_term
                 );
@@ -368,7 +371,11 @@ impl RaftHandle {
                 .await
                 .expect("Reset election timeout");
         } else {
-            trace!("{:?}: Heartbeat failed,", *self.inner.lock().unwrap(),);
+            trace!(
+                "{:?}: AppendEntries/heartbeat failed, my response is {:?}",
+                *self.inner.lock().unwrap(),
+                reply
+            );
         }
         Ok(reply)
     }
@@ -379,8 +386,6 @@ impl RaftHandle {
 struct State {
     current_term: usize,
     role: Role,
-    last_log_index: usize, // TODO take from logs
-    last_log_term: usize,  // TODO take from logs
     voted_for: Option<usize>,
     log: Log,
 }
@@ -478,9 +483,12 @@ impl Raft {
             self.heartbeat_task.take().map(|h| h.abort());
         }
 
+        let last_log_index = self.state.log.len();
+        let last_log_term = self.state.log.last_log_term();
+
         if (self.state.voted_for.is_none() || self.state.voted_for == Some(args.candidate_id))
-            && self.state.last_log_term <= args.last_log_term
-            && self.state.last_log_index <= args.last_log_index
+            && last_log_term <= args.last_log_term
+            && last_log_index <= args.last_log_index
         {
             self.state.voted_for = Some(args.candidate_id);
             let reply = RequestVoteReply {
@@ -505,13 +513,18 @@ impl Raft {
 
     fn append_entries_handler(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
         let resp = if args.term < self.state.current_term {
+            trace!(
+                "{self:?}: AppendEntries/heartbeat from outdated term {}, current term is {}",
+                args.term,
+                self.state.current_term
+            );
             AppendEntriesReply {
                 term: self.state.current_term,
                 success: false,
             }
         } else {
-            if self.state.log.get(args.prev_log_index).is_none()
-                || self.state.log[args.prev_log_index].term != args.prev_log_term
+            if self.state.log.get(args.prev_log_index).is_some()
+                && self.state.log[args.prev_log_index].term != args.prev_log_term
             {
                 // If the log entry at prev_log_index does not match the term, we reject the request
                 AppendEntriesReply {
@@ -561,11 +574,13 @@ impl Raft {
     }
 
     fn perform_election(&mut self) {
+        let last_log_index = self.state.log.len();
+        let last_log_term = self.state.log.last_log_term();
         let args = RequestVoteArgs {
             term: self.state.current_term,
             candidate_id: self.me,
-            last_log_index: self.state.last_log_index,
-            last_log_term: self.state.last_log_term,
+            last_log_index,
+            last_log_term,
         };
         trace!("{self:?}: starting election, args: {args:?}");
         let endpoint = self.ep.clone();
@@ -675,31 +690,31 @@ impl Raft {
         assert!(self.state.is_leader());
 
         let me = self.me;
-        let this = self.self_weak_ref.clone();
+        let raft_ref = self.self_weak_ref.clone();
 
         self.heartbeat_task = Some(madsim::task::spawn(async move {
             trace!("Raft({me}): starting heartbeat task");
             loop {
                 let (args, endpoint, peers) = {
-                    let that = match this.upgrade() {
+                    let raft = match raft_ref.upgrade() {
                         Some(raft) => raft,
                         None => {
                             warn!("Raft({me}): Heartbeat: Raft instance is gone");
                             return;
                         }
                     };
-                    let mut that = that.lock().unwrap();
+                    let mut raft_guard = raft.lock().unwrap();
                     (
                         AppendEntriesArgs {
-                            term: that.state.current_term,
-                            leader_id: that.me as usize,
-                            prev_log_index: that.state.last_log_index,
-                            prev_log_term: that.state.last_log_term,
+                            term: raft_guard.state.current_term,
+                            leader_id: raft_guard.me as usize,
+                            prev_log_index: raft_guard.state.log.len(),
+                            prev_log_term: raft_guard.state.log.last_log_term(),
                             entries: vec![],
-                            leader_commit: that.commit_index.load(Ordering::SeqCst),
+                            leader_commit: raft_guard.commit_index.load(Ordering::SeqCst),
                         },
-                        that.ep.clone(),
-                        that.peers.clone(),
+                        raft_guard.ep.clone(),
+                        raft_guard.peers.clone(),
                     )
                 };
 
@@ -709,10 +724,31 @@ impl Raft {
                     }
                     let ep = endpoint.clone();
                     let args = args.clone();
+                    let raft_ref_clone = raft_ref.clone();
                     madsim::task::spawn(async move {
                         trace!("Raft({me}): sending heartbeat to peer {}", peer);
-                        ep.call(peer, args).await
-                        // TODO react to heartbeat response (e.g. change state to follower if term is outdated)
+                        let resp = ep.call(peer, args).await;
+                        match resp {
+                            Ok(resp) => {
+                                let raft = match raft_ref_clone.upgrade() {
+                                    Some(raft) => raft,
+                                    None => {
+                                        warn!("Raft({me}): Heartbeat: Raft instance is gone");
+                                        return;
+                                    }
+                                };
+                                let mut raft_guard = raft.lock().unwrap();
+                                if resp.term < raft_guard.state.current_term {
+                                    raft_guard.change_state(Role::Follower, resp.term);
+                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Raft({me}): Heartbeat: error sending to peer {peer}: {:?}",
+                                    err
+                                );
+                            }
+                        }
                     });
                 }
 
@@ -755,7 +791,7 @@ impl Raft {
             let log = Arc::new(AsyncMutex::new(Log::new())); // TODO: Replace with actual log reference
 
             // Start with next_index just after the last entry in the log
-            let next_index = self.state.last_log_index + 1;
+            let next_index = self.state.log.len() + 1;
 
             // Create a follower sync instance
             let mut follower_sync = FollowerSync::new(
