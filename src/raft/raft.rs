@@ -167,7 +167,10 @@ impl RaftHandle {
         madsim::task::spawn(async move {
             loop {
                 let heartbeat_timeout = Raft::generate_election_timeout();
-                debug!("Raft({}): Heartbeat timeout: {:?}", me, heartbeat_timeout);
+                debug!(
+                    "Raft({}): Drawn heartbeat timeout: {:?}",
+                    me, heartbeat_timeout
+                );
                 let mut sleep = time::sleep(heartbeat_timeout).fuse();
 
                 // If timeout and heartbeat happen simultaneously, prefer timeout
@@ -232,7 +235,7 @@ impl RaftHandle {
     /// Raft log, since the leader may fail or lose an election.
     pub async fn start(&self, cmd: &[u8]) -> Result<Start> {
         let mut raft = self.inner.lock().unwrap();
-        info!("{:?} start", *raft);
+        info!("{:?} start agreement", *raft);
         raft.start(cmd)
     }
 
@@ -425,9 +428,11 @@ impl Raft {
     fn start(&mut self, data: &[u8]) -> Result<Start> {
         if !self.state.is_leader() {
             let leader = (self.me + 1) % self.peers.len();
+            trace!("{self:?}: start agreement: not a leader");
             return Err(Error::NotLeader(leader));
         }
 
+        trace!("{self:?}: start agreement: leader, data: {:?}", data);
         let log_index = self.state.log.push(LogEntry {
             term: self.state.current_term as usize,
             data: data.to_vec(),
@@ -738,7 +743,7 @@ impl Raft {
                                     }
                                 };
                                 let mut raft_guard = raft.lock().unwrap();
-                                if resp.term < raft_guard.state.current_term {
+                                if resp.term > raft_guard.state.current_term {
                                     raft_guard.change_state(Role::Follower, resp.term);
                                 }
                             }
@@ -820,7 +825,7 @@ impl Raft {
                         FollowerSyncMsg::OutdatedTerm { peer_term, peer } => {
                             if let Some(raft) = self_weak_ref_clone.upgrade() {
                                 let mut raft_guard = raft.lock().unwrap();
-                                if peer_term < raft_guard.state.current_term {
+                                if peer_term > raft_guard.state.current_term {
                                     warn!(
                                         "Raft({}): Outdated term from peer {}, current term: {}, peer term: {}",
                                         me, peer, raft_guard.state.current_term, peer_term
@@ -978,6 +983,12 @@ impl<T: Transport> FollowerSync<T> {
         loop {
             // debug!("FollowerSync loop");
             let log = self.log.lock().await;
+            trace!(
+                "FollowerSync: next_index={}, log: {:?}",
+                self.next_index,
+                log
+            );
+
             let entries = log[self.next_index..].to_vec();
             let entries_len = entries.len();
             let new_match_index = self.match_index.load(Ordering::Relaxed) + entries_len;

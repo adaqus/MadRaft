@@ -260,6 +260,8 @@ impl RaftTester {
                 }
             }
 
+            trace!("one({:?}) start index={:?}", cmd, index);
+
             if let Some(index) = index {
                 // somebody claimed to be the leader and to have
                 // submitted our command; wait a while for agreement.
