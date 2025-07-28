@@ -30,7 +30,7 @@ fn init_logger() {
 
 #[madsim::test]
 async fn initial_election_2a() {
-    init_logger();
+    // init_logger();
 
     let servers = 3;
     let t = RaftTester::new(servers).await;
@@ -60,7 +60,7 @@ async fn initial_election_2a() {
 
 #[madsim::test]
 async fn reelection_2a() {
-    init_logger();
+    // init_logger();
 
     let servers = 3;
     let t = RaftTester::new(servers).await;
@@ -94,7 +94,7 @@ async fn reelection_2a() {
 
 #[madsim::test]
 async fn many_election_2a() {
-    init_logger();
+    // init_logger();
 
     let servers = 7;
     let iters = 10;
