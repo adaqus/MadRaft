@@ -1,12 +1,7 @@
-use crate::raft;
-
-use self::{logs::Log, msg::*};
-use core::sync;
+use self::logs::Log;
 use futures::{
-    channel::mpsc,
-    lock::Mutex as AsyncMutex,
-    stream::{AbortHandle, Abortable, FuturesUnordered},
-    FutureExt, SinkExt, StreamExt,
+    channel::mpsc, lock::Mutex as AsyncMutex, stream::FuturesUnordered, FutureExt, SinkExt,
+    StreamExt,
 };
 use madsim::{
     fs::{self, File},
@@ -19,9 +14,7 @@ use madsim::{
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::min,
-    fmt,
-    future::Future,
-    io,
+    fmt, io,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -29,7 +22,6 @@ use std::{
     },
 };
 use tracing::{debug, info, trace, warn};
-use tracing_subscriber::field::debug;
 use transport::Transport;
 
 mod logs;
@@ -112,14 +104,14 @@ struct Persist {
 
 impl fmt::Debug for Raft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // write!(f, "Raft({},t={},l=[{},{}],{:?})", self.me,)
+        let log_guard = self.state.log.lock().unwrap();
         write!(
             f,
             "Raft({},t={},lt={},li={})",
             self.me,
             self.state.current_term,
-            self.state.log.last_log_term(),
-            self.state.log.len()
+            log_guard.last_log_term(),
+            log_guard.len()
         )
     }
 }
@@ -141,7 +133,7 @@ impl RaftHandle {
             pending_election: None,
             heartbeat_task: None,
             commit_index: Arc::new(AtomicUsize::new(0)),
-            match_index: vec![0; peers_len],
+            match_index: vec![Arc::new(AtomicUsize::new(0)); peers_len],
             last_applied: 0,
             follower_sync_tasks: Vec::new(),
             commit_index_tasks: Vec::new(),
@@ -274,7 +266,7 @@ impl RaftHandle {
     /// including index. This means the service no longer needs the log through
     /// (and including) that index. Raft should now trim its log as much as
     /// possible.
-    pub async fn snapshot(&self, index: usize, snapshot: &[u8]) -> Result<()> {
+    pub async fn snapshot(&self, _index: usize, _snapshot: &[u8]) -> Result<()> {
         todo!()
     }
 
@@ -307,8 +299,8 @@ impl RaftHandle {
     /// Restore previously persisted state.
     async fn restore(&self) -> io::Result<()> {
         match fs::read("snapshot").await {
-            Ok(snapshot) => {
-                let this = self.inner.lock().unwrap();
+            Ok(_snapshot) => {
+                let _this = self.inner.lock().unwrap();
                 // this.snapshot = snapshot;
                 todo!("restore snapshot");
             }
@@ -317,7 +309,7 @@ impl RaftHandle {
         }
         match fs::read("state").await {
             Ok(state) => {
-                let persist: Persist = bincode::deserialize(&state).unwrap();
+                let _persist: Persist = bincode::deserialize(&state).unwrap();
                 todo!("restore state");
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -362,7 +354,7 @@ impl RaftHandle {
         // If so, we can reset the election timeout.
         if reply.success {
             {
-                let mut this = self.inner.lock().unwrap();
+                let this = self.inner.lock().unwrap();
                 trace!(
                     "{:?}: AppendEntries/heartbeat successful, updating term to {}",
                     *this,
@@ -385,12 +377,12 @@ impl RaftHandle {
 }
 
 /// State of a raft peer.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug)]
 struct State {
     current_term: usize,
     role: Role,
     voted_for: Option<usize>,
-    log: Log,
+    log: Arc<Mutex<Log>>,
 }
 
 struct Raft {
@@ -410,7 +402,7 @@ struct Raft {
     commit_index: Arc<AtomicUsize>,
 
     // Match index for each peer
-    match_index: Vec<usize>,
+    match_index: Vec<Arc<AtomicUsize>>,
 
     // Index of the last log entry applied to the state machine
     last_applied: usize,
@@ -433,12 +425,13 @@ impl Raft {
         }
 
         trace!("{self:?}: start agreement: leader, data: {:?}", data);
-        let log_index = self.state.log.push(LogEntry {
+        let log_index = self.state.log.lock().unwrap().push(LogEntry {
             term: self.state.current_term as usize,
             data: data.to_vec(),
         });
 
-        self.match_index[self.me] = log_index; // Update match index for self
+        let match_index = &self.match_index[self.me];
+        match_index.store(log_index, Ordering::SeqCst);
 
         Ok(Start {
             index: log_index as usize,
@@ -451,9 +444,12 @@ impl Raft {
         while self.commit_index.load(Ordering::SeqCst) > self.last_applied {
             self.last_applied += 1;
 
-            let msg = ApplyMsg::Command {
-                data: self.state.log[self.last_applied].data.clone(),
-                index: self.last_applied,
+            let msg = {
+                let log_guard = self.state.log.lock().unwrap();
+                ApplyMsg::Command {
+                    data: log_guard[self.last_applied].data.clone(),
+                    index: self.last_applied,
+                }
             };
             self.apply_ch.unbounded_send(msg).unwrap();
         }
@@ -488,8 +484,10 @@ impl Raft {
             self.heartbeat_task.take().map(|h| h.abort());
         }
 
-        let last_log_index = self.state.log.len();
-        let last_log_term = self.state.log.last_log_term();
+        let log_guard = self.state.log.lock().unwrap();
+        let last_log_index = log_guard.len();
+        let last_log_term = log_guard.last_log_term();
+        drop(log_guard);
 
         if (self.state.voted_for.is_none() || self.state.voted_for == Some(args.candidate_id))
             && last_log_term <= args.last_log_term
@@ -528,8 +526,9 @@ impl Raft {
                 success: false,
             }
         } else {
-            if self.state.log.get(args.prev_log_index).is_some()
-                && self.state.log[args.prev_log_index].term != args.prev_log_term
+            let mut log_guard = self.state.log.lock().unwrap();
+            if log_guard.get(args.prev_log_index).is_some()
+                && log_guard[args.prev_log_index].term != args.prev_log_term
             {
                 // If the log entry at prev_log_index does not match the term, we reject the request
                 AppendEntriesReply {
@@ -538,15 +537,15 @@ impl Raft {
                 }
             } else {
                 let new_log_index = args.prev_log_index + 1;
-                if self.state.log.get(new_log_index).is_some()
-                    && self.state.log[new_log_index].term != args.prev_log_term
+                if log_guard.get(new_log_index).is_some()
+                    && log_guard[new_log_index].term != args.prev_log_term
                 {
                     // If logs are conflicting, replace own log with leader's log
-                    self.state.log.clear_from(new_log_index);
+                    log_guard.clear_from(new_log_index);
                 }
 
                 args.entries.iter().for_each(|entry| {
-                    self.state.log.push(LogEntry {
+                    log_guard.push(LogEntry {
                         term: args.term,
                         data: entry.data.clone(),
                     });
@@ -554,7 +553,7 @@ impl Raft {
 
                 // Update own commit index
                 if args.leader_commit > self.commit_index.load(Ordering::SeqCst) {
-                    let new_commit_index = min(args.leader_commit, self.state.log.len());
+                    let new_commit_index = min(args.leader_commit, log_guard.len());
                     self.commit_index.store(new_commit_index, Ordering::SeqCst);
                 }
 
@@ -579,8 +578,10 @@ impl Raft {
     }
 
     fn perform_election(&mut self) {
-        let last_log_index = self.state.log.len();
-        let last_log_term = self.state.log.last_log_term();
+        let log_guard = self.state.log.lock().unwrap();
+        let last_log_index = log_guard.len();
+        let last_log_term = log_guard.last_log_term();
+        drop(log_guard);
         let args = RequestVoteArgs {
             term: self.state.current_term,
             candidate_id: self.me,
@@ -708,13 +709,14 @@ impl Raft {
                             return;
                         }
                     };
-                    let mut raft_guard = raft.lock().unwrap();
+                    let raft_guard = raft.lock().unwrap();
+                    let log_guard = raft_guard.state.log.lock().unwrap();
                     (
                         AppendEntriesArgs {
                             term: raft_guard.state.current_term,
                             leader_id: raft_guard.me as usize,
-                            prev_log_index: raft_guard.state.log.len(),
-                            prev_log_term: raft_guard.state.log.last_log_term(),
+                            prev_log_index: log_guard.len(),
+                            prev_log_term: log_guard.last_log_term(),
                             entries: vec![],
                             leader_commit: raft_guard.commit_index.load(Ordering::SeqCst),
                         },
@@ -790,19 +792,19 @@ impl Raft {
             )));
 
             // Create a match index tracker for this peer
-            let match_index = Arc::new(AtomicUsize::new(0));
+            let match_index = self.match_index[i].clone();
 
             // Get log reference
-            let log = Arc::new(AsyncMutex::new(Log::new())); // TODO: Replace with actual log reference
+            let log = self.state.log.clone();
 
             // Start with next_index just after the last entry in the log
-            let next_index = self.state.log.len() + 1;
+            let next_index = log.lock().unwrap().len();
 
             // Create a follower sync instance
             let mut follower_sync = FollowerSync::new(
                 leader_commit_index,
                 transport.clone(),
-                log.clone(),
+                log,
                 next_index,
                 match_index.clone(),
                 me as usize,
@@ -841,7 +843,7 @@ impl Raft {
                                     "Raft({}): Updating commit index to {} from peer {}",
                                     me, index, peer
                                 );
-                                raft_guard.match_index[peer] = index;
+                                raft_guard.match_index[peer].store(index, Ordering::SeqCst);
                                 raft_guard.update_commit_index();
                             }
                         }
@@ -863,7 +865,11 @@ impl Raft {
         let current_commit_index = self.commit_index.load(Ordering::SeqCst);
 
         // Sort the match indices in descending order
-        let mut match_indices = self.match_index.clone();
+        let mut match_indices = self
+            .match_index
+            .iter()
+            .map(|x| x.load(Ordering::SeqCst))
+            .collect::<Vec<_>>();
         match_indices.sort_unstable();
 
         // Find the log index that a majority of servers have replicated (median of match indices)
@@ -872,10 +878,16 @@ impl Raft {
 
         // Only update if the majority match index is greater than our current commit index
         if majority_match_index > current_commit_index {
+            debug!(
+                "Raft({}): Majority match index is {}, current commit index is {}",
+                self.me, majority_match_index, current_commit_index
+            );
             // Only commit entries from the current term
             let term_at_index = self
                 .state
                 .log
+                .lock()
+                .unwrap()
                 .get(majority_match_index)
                 .map(|entry| entry.term)
                 .unwrap_or(0);
@@ -889,6 +901,11 @@ impl Raft {
                     .store(majority_match_index, Ordering::SeqCst);
 
                 self.apply();
+            } else {
+                debug!(
+                    "Raft({}): Not updating commit index, term at index {} is {}, current term is {}",
+                    self.me, majority_match_index, term_at_index, self.state.current_term
+                );
             }
         }
     }
@@ -950,7 +967,7 @@ pub struct FollowerSync<T: Transport> {
     next_index: usize,
     match_index: Arc<AtomicUsize>,
     transport: Arc<AsyncMutex<T>>,
-    log: Arc<AsyncMutex<Log>>,
+    log: Arc<Mutex<Log>>,
     leader_id: usize,
     leader_term: usize,
     sync_sender: mpsc::UnboundedSender<FollowerSyncMsg>,
@@ -960,7 +977,7 @@ impl<T: Transport> FollowerSync<T> {
     pub fn new(
         leader_commit_index: Arc<AtomicUsize>,
         transport: Arc<AsyncMutex<T>>,
-        log: Arc<AsyncMutex<Log>>,
+        log: Arc<Mutex<Log>>,
         next_index: usize,
         match_index: Arc<AtomicUsize>,
         leader_id: usize,
@@ -982,21 +999,27 @@ impl<T: Transport> FollowerSync<T> {
     pub async fn sync_loop(&mut self, peer_addr: SocketAddr, peer_number: usize) {
         loop {
             // debug!("FollowerSync loop");
-            let log = self.log.lock().await;
-            trace!(
-                "FollowerSync: next_index={}, log: {:?}",
-                self.next_index,
-                log
-            );
+            let (entries, prev_log_term) = {
+                let log = self.log.lock().unwrap();
+                trace!(
+                    "FollowerSync: peer={}, next_index={}, log: {:?}",
+                    peer_number,
+                    self.next_index,
+                    log
+                );
 
-            let entries = log[self.next_index..].to_vec();
+                let entries = log.get_from(self.next_index).to_vec();
+                let prev_log_term = log.prev_log(self.next_index).map(|l| l.term).unwrap_or(0);
+
+                (entries, prev_log_term)
+            };
+
             let entries_len = entries.len();
             let new_match_index = self.match_index.load(Ordering::Relaxed) + entries_len;
-            let prev_log_term = log.prev_log(self.next_index).map(|l| l.term).unwrap_or(0);
-            drop(log);
 
             trace!(
-                "FollowerSync: next_index={}, entries_len={}, new_match_index={}, prev_log_term={}",
+                "FollowerSync: peer={}, next_index={}, entries_len={}, new_match_index={}, prev_log_term={}",
+                peer_number,
                 self.next_index,
                 entries_len,
                 new_match_index,
@@ -1074,7 +1097,7 @@ impl<T: Transport> FollowerSync<T> {
             }
 
             // Give the peer some time to process the entries
-            time::sleep(Raft::generate_election_timeout()).await;
+            time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
@@ -1084,7 +1107,7 @@ mod tests {
     use std::{
         any::Any,
         net::SocketAddr,
-        sync::{atomic::AtomicUsize, Arc},
+        sync::{atomic::AtomicUsize, Arc, Mutex},
         time::Duration,
         vec,
     };
@@ -1118,7 +1141,7 @@ mod tests {
     ) -> (
         FollowerSync<MockTransport>,
         Arc<AsyncMutex<MockTransport>>,
-        Arc<AsyncMutex<Log>>,
+        Arc<Mutex<Log>>,
         Arc<AtomicUsize>,
         mpsc::UnboundedReceiver<FollowerSyncMsg>,
     ) {
@@ -1131,9 +1154,9 @@ mod tests {
         }
 
         let transport = Arc::new(AsyncMutex::new(MockTransport::new()));
-        let mut log = Arc::new(AsyncMutex::new(log_inner));
+        let mut log = Arc::new(Mutex::new(log_inner));
         let commit_index = Arc::new(AtomicUsize::new(0));
-        let next_index = log.lock().await.len();
+        let next_index = log.lock().unwrap().len();
         let match_index = Arc::new(AtomicUsize::new(0));
         let leader_id = 0;
         let leader_term = 1;
@@ -1179,12 +1202,13 @@ mod tests {
         );
         assert_eq!(1, match_index.load(std::sync::atomic::Ordering::SeqCst));
 
-        let mut log_guard = log.lock().await;
-        log_guard.push(LogEntry {
-            term: 1,
-            data: vec![4, 5, 6],
-        });
-        drop(log_guard);
+        {
+            let mut log_guard = log.lock().unwrap();
+            log_guard.push(LogEntry {
+                term: 1,
+                data: vec![4, 5, 6],
+            });
+        }
 
         let transport_guard = transport.lock().await;
         transport_guard
@@ -1202,14 +1226,15 @@ mod tests {
         );
         assert_eq!(2, match_index.load(std::sync::atomic::Ordering::SeqCst));
 
-        let mut log_guard = log.lock().await;
-        for _ in 0..1000 {
-            log_guard.push(LogEntry {
-                term: 1,
-                data: vec![7, 8, 9],
-            });
+        {
+            let mut log_guard = log.lock().unwrap();
+            for _ in 0..1000 {
+                log_guard.push(LogEntry {
+                    term: 1,
+                    data: vec![7, 8, 9],
+                });
+            }
         }
-        drop(log_guard);
 
         let transport_guard = transport.lock().await;
         transport_guard

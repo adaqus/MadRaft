@@ -19,8 +19,8 @@ impl Default for Log {
 impl Log {
     pub fn new() -> Self {
         Log {
-            offset: 1,
-            entries: vec![],
+            offset: 0,
+            entries: vec![LogEntry::default()],
         }
     }
 
@@ -36,11 +36,13 @@ impl Log {
 
     pub fn push(&mut self, log: LogEntry) -> LogIndex {
         self.entries.push(log);
-        self.offset += 1;
-        self.offset
+        self.entries.len() + self.offset - 1
     }
 
     pub fn prev_log(&self, index: usize) -> Option<&LogEntry> {
+        if index == 0 || index <= self.offset {
+            return None;
+        }
         self.get(index - 1)
     }
 
@@ -48,9 +50,22 @@ impl Log {
         self.entries.last().map(|e| e.term).unwrap_or(0)
     }
 
+    pub fn get_from(&self, index: LogIndex) -> &[LogEntry] {
+        if index < self.offset {
+            &[]
+        } else {
+            let start = index - self.offset;
+            if self.entries.len() <= start {
+                &[]
+            } else {
+                &self.entries[start..]
+            }
+        }
+    }
+
     // Clear all entries from the log starting from the given index
     pub fn clear_from(&mut self, index: LogIndex) {
-        if index < self.offset {
+        if index > self.offset {
             self.entries.truncate(index - 1);
         }
     }

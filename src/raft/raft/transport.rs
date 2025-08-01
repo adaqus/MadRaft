@@ -1,4 +1,3 @@
-use super::Result;
 use madsim::net::{rpc::Request, Endpoint};
 use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -73,7 +72,6 @@ pub mod testing {
     use serde::Serialize;
     use tracing::debug;
 
-    use super::Result;
     use super::Transport;
 
     pub struct MockTransport {
