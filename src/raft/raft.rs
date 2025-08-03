@@ -133,7 +133,9 @@ impl RaftHandle {
             pending_election: None,
             heartbeat_task: None,
             commit_index: Arc::new(AtomicUsize::new(0)),
-            match_index: vec![Arc::new(AtomicUsize::new(0)); peers_len],
+            match_index: (0..peers_len)
+                .map(|_| Arc::new(AtomicUsize::new(0)))
+                .collect(),
             last_applied: 0,
             follower_sync_tasks: Vec::new(),
             commit_index_tasks: Vec::new(),
@@ -432,6 +434,7 @@ impl Raft {
 
         let match_index = &self.match_index[self.me];
         match_index.store(log_index, Ordering::SeqCst);
+        trace!("{self:?}: leader: log entry pushed at index {}", log_index);
 
         Ok(Start {
             index: log_index as usize,
@@ -843,7 +846,7 @@ impl Raft {
                                     "Raft({}): Updating commit index to {} from peer {}",
                                     me, index, peer
                                 );
-                                raft_guard.match_index[peer].store(index, Ordering::SeqCst);
+                                // raft_guard.match_index[peer].store(index, Ordering::SeqCst);
                                 raft_guard.update_commit_index();
                             }
                         }
@@ -870,6 +873,11 @@ impl Raft {
             .iter()
             .map(|x| x.load(Ordering::SeqCst))
             .collect::<Vec<_>>();
+        trace!(
+            "Raft({}): Match indices before sorting: {:?}",
+            self.me,
+            match_indices
+        );
         match_indices.sort_unstable();
 
         // Find the log index that a majority of servers have replicated (median of match indices)
@@ -1015,13 +1023,15 @@ impl<T: Transport> FollowerSync<T> {
             };
 
             let entries_len = entries.len();
-            let new_match_index = self.match_index.load(Ordering::Relaxed) + entries_len;
+            let match_index = self.match_index.load(Ordering::SeqCst);
+            let new_match_index = match_index + entries_len;
 
             trace!(
-                "FollowerSync: peer={}, next_index={}, entries_len={}, new_match_index={}, prev_log_term={}",
+                "FollowerSync: peer={}, next_index={}, entries_len={}, match_index={}, new_match_index={}, prev_log_term={}",
                 peer_number,
                 self.next_index,
                 entries_len,
+                match_index,
                 new_match_index,
                 prev_log_term
             );
@@ -1063,7 +1073,7 @@ impl<T: Transport> FollowerSync<T> {
 
                         if reply.success {
                             debug!("Peer {} accepted {} entries", peer_addr, entries_len);
-                            self.match_index.store(new_match_index, Ordering::Relaxed);
+                            self.match_index.store(new_match_index, Ordering::SeqCst);
                             self.next_index = new_match_index + 1;
                             self.sync_sender
                                 .send(FollowerSyncMsg::UpdateCommitIndex {
