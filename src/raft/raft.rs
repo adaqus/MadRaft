@@ -561,8 +561,7 @@ impl Raft {
                 // Update own commit index
                 if args.leader_commit > self.commit_index.load(Ordering::SeqCst) {
                     let new_commit_index = min(args.leader_commit, log_guard.len());
-                    self.commit_index
-                        .store(new_commit_index.saturating_sub(1), Ordering::SeqCst);
+                    self.commit_index.store(new_commit_index, Ordering::SeqCst);
                 }
 
                 // If the log entry matches, we accept the request

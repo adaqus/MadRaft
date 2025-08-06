@@ -130,7 +130,7 @@ async fn many_election_2a() {
 
 #[madsim::test]
 async fn basic_agree_2b() {
-    init_logger();
+    // init_logger();
 
     let servers = 5;
     let t = RaftTester::new(servers).await;
@@ -333,7 +333,7 @@ async fn rejoin_2b() {
 
 #[madsim::test]
 async fn backup_2b() {
-    init_logger();
+    // init_logger();
 
     let servers = 5;
     let t = RaftTester::new(servers).await;
@@ -501,7 +501,7 @@ async fn count_2b() {
 
 #[madsim::test]
 async fn persistence_node_crash_2c() {
-    init_logger();
+    // init_logger();
 
     let servers = 3;
     let t = RaftTester::new(servers).await;
