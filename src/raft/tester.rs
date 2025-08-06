@@ -331,7 +331,7 @@ impl RaftTester {
             while let Some(cmd) = apply_recver.next().await {
                 match cmd {
                     ApplyMsg::Command { data, index } => {
-                        debug!("server {} apply {}", i, index);
+                        debug!("server {} apply {}, data: {:?}", i, index, data);
                         let entry =
                             bincode::deserialize(&data).expect("committed command is not an entry");
                         storage.push_and_check(i, index, entry);

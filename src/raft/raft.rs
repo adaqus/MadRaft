@@ -419,6 +419,8 @@ struct Raft {
 
 // HINT: put mutable non-async functions here
 impl Raft {
+    /// TODO: handle case when this peer stops being a leader immediately after calling is_leader()
+    ///       it is possible when election timeout occurs right after follower voted this peer and became a candidate
     fn start(&mut self, data: &[u8]) -> Result<Start> {
         if !self.state.is_leader() {
             let leader = (self.me + 1) % self.peers.len();
@@ -444,9 +446,10 @@ impl Raft {
 
     // Here is an example to apply committed message.
     fn apply(&mut self) {
-        while self.commit_index.load(Ordering::SeqCst) > self.last_applied {
+        let commit_index = self.commit_index.load(Ordering::SeqCst);
+        trace!("({self:?}) applying committed entries from last_applied={} to commit_index={commit_index}", self.last_applied);
+        while commit_index > self.last_applied {
             self.last_applied += 1;
-
             let msg = {
                 let log_guard = self.state.log.lock().unwrap();
                 ApplyMsg::Command {
@@ -455,6 +458,7 @@ impl Raft {
                 }
             };
             self.apply_ch.unbounded_send(msg).unwrap();
+            trace!("({self:?}) last_applied={}", self.last_applied);
         }
     }
 
@@ -557,7 +561,8 @@ impl Raft {
                 // Update own commit index
                 if args.leader_commit > self.commit_index.load(Ordering::SeqCst) {
                     let new_commit_index = min(args.leader_commit, log_guard.len());
-                    self.commit_index.store(new_commit_index, Ordering::SeqCst);
+                    self.commit_index
+                        .store(new_commit_index.saturating_sub(1), Ordering::SeqCst);
                 }
 
                 // If the log entry matches, we accept the request

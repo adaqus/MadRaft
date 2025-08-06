@@ -333,6 +333,8 @@ async fn rejoin_2b() {
 
 #[madsim::test]
 async fn backup_2b() {
+    init_logger();
+
     let servers = 5;
     let t = RaftTester::new(servers).await;
 
