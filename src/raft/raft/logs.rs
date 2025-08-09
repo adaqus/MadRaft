@@ -50,6 +50,10 @@ impl Log {
         self.entries.last().map(|e| e.term).unwrap_or(0)
     }
 
+    pub fn last_log_index(&self) -> usize {
+        self.len() - 1 + self.offset
+    }
+
     pub fn get_from(&self, index: LogIndex) -> &[LogEntry] {
         if index < self.offset {
             &[]

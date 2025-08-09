@@ -150,6 +150,8 @@ async fn basic_agree_2b() {
 
 #[madsim::test]
 async fn fail_agree_2b() {
+    // init_logger();
+
     let servers = 3;
     let t = RaftTester::new(servers).await;
 

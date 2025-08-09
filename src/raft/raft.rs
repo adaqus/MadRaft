@@ -37,6 +37,9 @@ pub struct RaftHandle {
 type MsgSender = mpsc::UnboundedSender<ApplyMsg>;
 pub type MsgRecver = mpsc::UnboundedReceiver<ApplyMsg>;
 type Term = usize;
+type HeartbeatAccepted = bool;
+
+const MIN_ELECTION_TIMEOUT_MILLIS: u64 = 150;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -111,7 +114,7 @@ impl fmt::Debug for Raft {
             self.me,
             self.state.current_term,
             log_guard.last_log_term(),
-            log_guard.len()
+            log_guard.last_log_index()
         )
     }
 }
@@ -175,6 +178,11 @@ impl RaftHandle {
                         warn!("{:?}: No heartbeat received within {:?}", *raft_guard, heartbeat_timeout);
                         if raft_guard.state.is_leader() {
                             info!("{:?}: I'm the leader, no need to start election", raft_guard);
+                            continue;
+                        }
+                        if raft_guard.state.last_vote_time.is_some() &&
+                           raft_guard.state.last_vote_time.unwrap().elapsed() < Duration::from_millis(MIN_ELECTION_TIMEOUT_MILLIS) {
+                            info!("{:?}: I'm a follower, but I have already voted recently, no need to start election", raft_guard);
                             continue;
                         }
                         trace!("Old state: {:?}", raft_guard.state);
@@ -347,7 +355,7 @@ impl RaftHandle {
         args: AppendEntriesArgs,
     ) -> Result<AppendEntriesReply> {
         let leader_term = args.term;
-        let reply = {
+        let (reply, heartbeat_accepted) = {
             let mut this = self.inner.lock().unwrap();
             this.append_entries_handler(args)
         };
@@ -363,16 +371,19 @@ impl RaftHandle {
                     leader_term
                 );
             }
-            self.heartbeat_sender
-                .send(leader_term)
-                .await
-                .expect("Reset election timeout");
         } else {
             trace!(
                 "{:?}: AppendEntries/heartbeat failed, my response is {:?}",
                 *self.inner.lock().unwrap(),
                 reply
             );
+        }
+
+        if heartbeat_accepted {
+            self.heartbeat_sender
+                .send(leader_term)
+                .await
+                .expect("Reset election timeout");
         }
         Ok(reply)
     }
@@ -384,6 +395,7 @@ struct State {
     current_term: usize,
     role: Role,
     voted_for: Option<usize>,
+    last_vote_time: Option<Instant>,
     log: Arc<Mutex<Log>>,
 }
 
@@ -481,7 +493,7 @@ impl Raft {
         // If we are a candidate, we can stop the election, because other candidate has higher term
         if args.term > self.state.current_term {
             trace!(
-                "{self:?}: received {:?} with higher ter, switching to follower",
+                "{self:?}: received {:?} with higher term, switching to follower",
                 args
             );
             self.state.role = Role::Follower;
@@ -489,10 +501,14 @@ impl Raft {
             self.state.voted_for = None;
             self.pending_election.take().map(|e| e.abort());
             self.heartbeat_task.take().map(|h| h.abort());
+            self.follower_sync_tasks.iter_mut().for_each(|f| f.abort());
+            self.follower_sync_tasks.clear();
+            self.commit_index_tasks.iter_mut().for_each(|c| c.abort());
+            self.commit_index_tasks.clear();
         }
 
         let log_guard = self.state.log.lock().unwrap();
-        let last_log_index = log_guard.len();
+        let last_log_index = log_guard.last_log_index();
         let last_log_term = log_guard.last_log_term();
         drop(log_guard);
 
@@ -501,6 +517,7 @@ impl Raft {
             && last_log_index <= args.last_log_index
         {
             self.state.voted_for = Some(args.candidate_id);
+            self.state.last_vote_time = Some(Instant::now());
             let reply = RequestVoteReply {
                 term: self.state.current_term,
                 vote_granted: true,
@@ -521,32 +538,58 @@ impl Raft {
         reply
     }
 
-    fn append_entries_handler(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
+    fn append_entries_handler(
+        &mut self,
+        args: AppendEntriesArgs,
+    ) -> (AppendEntriesReply, HeartbeatAccepted) {
         let resp = if args.term < self.state.current_term {
             trace!(
                 "{self:?}: AppendEntries/heartbeat from outdated term {}, current term is {}",
                 args.term,
                 self.state.current_term
             );
-            AppendEntriesReply {
-                term: self.state.current_term,
-                success: false,
-            }
-        } else {
-            let mut log_guard = self.state.log.lock().unwrap();
-            if log_guard.get(args.prev_log_index).is_some()
-                && log_guard[args.prev_log_index].term != args.prev_log_term
-            {
-                // If the log entry at prev_log_index does not match the term, we reject the request
+            trace!(
+                "{self:?}: append entries handler: rejecting, args term: {}, current term: {}",
+                args.term,
+                self.state.current_term
+            );
+            (
                 AppendEntriesReply {
                     term: self.state.current_term,
                     success: false,
-                }
+                },
+                false,
+            )
+        } else {
+            let mut log_guard = self.state.log.lock().unwrap();
+            if log_guard.get(args.prev_log_index).is_none()
+                || log_guard[args.prev_log_index].term != args.prev_log_term
+            {
+                let prev_log_term = log_guard
+                    .get(args.prev_log_index)
+                    .map(|e| format!("{}", e.term))
+                    .unwrap_or_else(|| "none".into());
+                let prev_log_index = log_guard.get(args.prev_log_index).is_some();
+                trace!("append entries handler: rejecting, prev index exists: {}, arg term: {}, prev log term: {}",
+                    prev_log_index, args.prev_log_term, prev_log_term
+                );
+                // If the log entry at prev_log_index does not match the term, we reject the request
+                (
+                    AppendEntriesReply {
+                        term: self.state.current_term,
+                        success: false,
+                    },
+                    true,
+                )
             } else {
                 let new_log_index = args.prev_log_index + 1;
                 if log_guard.get(new_log_index).is_some()
                     && log_guard[new_log_index].term != args.prev_log_term
                 {
+                    trace!(
+                        "append entries handler: log conflict, clearing from index {}",
+                        new_log_index
+                    );
                     // If logs are conflicting, replace own log with leader's log
                     log_guard.clear_from(new_log_index);
                 }
@@ -560,15 +603,18 @@ impl Raft {
 
                 // Update own commit index
                 if args.leader_commit > self.commit_index.load(Ordering::SeqCst) {
-                    let new_commit_index = min(args.leader_commit, log_guard.len());
+                    let new_commit_index = min(args.leader_commit, log_guard.last_log_index());
                     self.commit_index.store(new_commit_index, Ordering::SeqCst);
                 }
 
                 // If the log entry matches, we accept the request
-                AppendEntriesReply {
-                    term: self.state.current_term,
-                    success: true,
-                }
+                (
+                    AppendEntriesReply {
+                        term: self.state.current_term,
+                        success: true,
+                    },
+                    true,
+                )
             }
         };
 
@@ -581,12 +627,12 @@ impl Raft {
     // Here is an example to generate random number.
     fn generate_election_timeout() -> Duration {
         // see rand crate for more details
-        Duration::from_millis(rand::thread_rng().gen_range(150..300))
+        Duration::from_millis(rand::thread_rng().gen_range(MIN_ELECTION_TIMEOUT_MILLIS..300))
     }
 
     fn perform_election(&mut self) {
         let log_guard = self.state.log.lock().unwrap();
-        let last_log_index = log_guard.len();
+        let last_log_index = log_guard.last_log_index();
         let last_log_term = log_guard.last_log_term();
         drop(log_guard);
         let args = RequestVoteArgs {
@@ -722,7 +768,7 @@ impl Raft {
                         AppendEntriesArgs {
                             term: raft_guard.state.current_term,
                             leader_id: raft_guard.me as usize,
-                            prev_log_index: log_guard.len(),
+                            prev_log_index: log_guard.last_log_index(),
                             prev_log_term: log_guard.last_log_term(),
                             entries: vec![],
                             leader_commit: raft_guard.commit_index.load(Ordering::SeqCst),
@@ -740,7 +786,7 @@ impl Raft {
                     let args = args.clone();
                     let raft_ref_clone = raft_ref.clone();
                     madsim::task::spawn(async move {
-                        trace!("Raft({me}): sending heartbeat to peer {}", peer);
+                        trace!("Raft({me}): sending heartbeat to peer {} {:?}", peer, args);
                         let resp = ep.call(peer, args).await;
                         match resp {
                             Ok(resp) => {
@@ -805,7 +851,7 @@ impl Raft {
             let log = self.state.log.clone();
 
             // Start with next_index just after the last entry in the log
-            let next_index = log.lock().unwrap().len();
+            let next_index = log.lock().unwrap().last_log_index() + 1;
 
             // Create a follower sync instance
             let mut follower_sync = FollowerSync::new(
@@ -1059,7 +1105,7 @@ impl<T: Transport> FollowerSync<T> {
                         .await
                 };
 
-                debug!("Received reply from peer {}: {:?}", peer_addr, reply);
+                trace!("Received reply from peer {}: {:?}", peer_addr, reply);
 
                 match reply {
                     Ok(reply) => {
