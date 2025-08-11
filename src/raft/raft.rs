@@ -505,6 +505,9 @@ impl Raft {
             self.follower_sync_tasks.clear();
             self.commit_index_tasks.iter_mut().for_each(|c| c.abort());
             self.commit_index_tasks.clear();
+            self.match_index
+                .iter_mut()
+                .for_each(|m| m.store(0, Ordering::SeqCst));
         }
 
         let log_guard = self.state.log.lock().unwrap();
@@ -570,8 +573,8 @@ impl Raft {
                     .map(|e| format!("{}", e.term))
                     .unwrap_or_else(|| "none".into());
                 let prev_log_index = log_guard.get(args.prev_log_index).is_some();
-                trace!("append entries handler: rejecting, prev index exists: {}, arg term: {}, prev log term: {}",
-                    prev_log_index, args.prev_log_term, prev_log_term
+                trace!("append entries handler: rejecting, prev index exists: {}, arg term: {}, prev log term: {}, my log: {:?}",
+                    prev_log_index, args.prev_log_term, prev_log_term, log_guard
                 );
                 // If the log entry at prev_log_index does not match the term, we reject the request
                 (
@@ -596,7 +599,7 @@ impl Raft {
 
                 args.entries.iter().for_each(|entry| {
                     log_guard.push(LogEntry {
-                        term: args.term,
+                        term: entry.term,
                         data: entry.data.clone(),
                     });
                 });
@@ -743,6 +746,9 @@ impl Raft {
         self.follower_sync_tasks.clear();
         self.commit_index_tasks.iter_mut().for_each(|c| c.abort());
         self.commit_index_tasks.clear();
+        self.match_index
+            .iter_mut()
+            .for_each(|m| m.store(0, Ordering::SeqCst));
     }
 
     fn start_heartbeat_task(&mut self) {
@@ -1057,7 +1063,7 @@ impl<T: Transport> FollowerSync<T> {
     pub async fn sync_loop(&mut self, peer_addr: SocketAddr, peer_number: usize) {
         loop {
             // debug!("FollowerSync loop");
-            let (entries, prev_log_term) = {
+            let (entries, prev_log_term, last_log_index) = {
                 let log = self.log.lock().unwrap();
                 trace!(
                     "FollowerSync: peer={}, next_index={}, log: {:?}",
@@ -1068,13 +1074,14 @@ impl<T: Transport> FollowerSync<T> {
 
                 let entries = log.get_from(self.next_index).to_vec();
                 let prev_log_term = log.prev_log(self.next_index).map(|l| l.term).unwrap_or(0);
+                let last_log_index = log.last_log_index();
 
-                (entries, prev_log_term)
+                (entries, prev_log_term, last_log_index)
             };
 
             let entries_len = entries.len();
             let match_index = self.match_index.load(Ordering::SeqCst);
-            let new_match_index = match_index + entries_len;
+            let new_match_index = last_log_index;
 
             trace!(
                 "FollowerSync: peer={}, next_index={}, entries_len={}, match_index={}, new_match_index={}, prev_log_term={}",
@@ -1086,75 +1093,78 @@ impl<T: Transport> FollowerSync<T> {
                 prev_log_term
             );
 
-            if entries_len > 0 {
-                debug!("Send {} entries to peer {}", entries.len(), peer_addr);
+            debug!(
+                "Send {} entries to peer {}. Entries: {:?}",
+                entries.len(),
+                peer_addr,
+                entries
+            );
 
-                let args = AppendEntriesArgs {
-                    term: self.leader_term,
-                    leader_id: self.leader_id,
-                    prev_log_index: self.next_index - 1,
-                    prev_log_term,
-                    entries,
-                    leader_commit: self.leader_commit_index.load(Ordering::SeqCst),
-                };
+            let args = AppendEntriesArgs {
+                term: self.leader_term,
+                leader_id: self.leader_id,
+                prev_log_index: self.next_index - 1,
+                prev_log_term,
+                entries,
+                leader_commit: self.leader_commit_index.load(Ordering::SeqCst),
+            };
 
-                let reply = {
-                    let mut transport = self.transport.lock().await;
-                    transport
-                        .call_timeout(peer_addr, args, Duration::from_secs(5))
-                        .await
-                };
+            let reply = {
+                let mut transport = self.transport.lock().await;
+                transport
+                    .call_timeout(peer_addr, args, Duration::from_secs(5))
+                    .await
+            };
 
-                trace!("Received reply from peer {}: {:?}", peer_addr, reply);
+            trace!("Received reply from peer {}: {:?}", peer_addr, reply);
 
-                match reply {
-                    Ok(reply) => {
-                        if reply.term > self.leader_term {
-                            debug!("Peer {} has higher term, aborting sync", peer_addr);
-                            self.sync_sender
-                                .send(FollowerSyncMsg::OutdatedTerm {
-                                    peer_term: self.leader_term,
-                                    peer: reply.term,
-                                })
-                                .await
-                                .expect("Failed to send outdated term message");
-                            break;
-                        }
-
-                        if reply.success {
-                            debug!("Peer {} accepted {} entries", peer_addr, entries_len);
-                            self.match_index.store(new_match_index, Ordering::SeqCst);
-                            self.next_index = new_match_index + 1;
-                            self.sync_sender
-                                .send(FollowerSyncMsg::UpdateCommitIndex {
-                                    index: new_match_index,
-                                    peer: peer_number,
-                                })
-                                .await
-                                .expect("Failed to send update commit index message");
-                            debug!("Sent update commit index message to sync channel");
-                        } else {
-                            debug!(
-                                "Peer {} rejected {} entries, retrying from earlier entry",
-                                peer_addr, entries_len
-                            );
-                            // TODO backoff
-                            time::sleep(Duration::from_millis(5)).await;
-                            self.next_index -= 1;
-                            continue;
-                        }
+            match reply {
+                Ok(reply) => {
+                    if reply.term > self.leader_term {
+                        debug!("Peer {} has higher term, aborting sync", peer_addr);
+                        self.sync_sender
+                            .send(FollowerSyncMsg::OutdatedTerm {
+                                peer_term: self.leader_term,
+                                peer: reply.term,
+                            })
+                            .await
+                            .expect("Failed to send outdated term message");
+                        break;
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to send AppendEntries to peer {}: {:?}, retrying",
-                            peer_addr, e
+
+                    if reply.success {
+                        debug!("Peer {} accepted {} entries", peer_addr, entries_len);
+                        self.match_index.store(new_match_index, Ordering::SeqCst);
+                        self.next_index = new_match_index + 1;
+                        self.sync_sender
+                            .send(FollowerSyncMsg::UpdateCommitIndex {
+                                index: new_match_index,
+                                peer: peer_number,
+                            })
+                            .await
+                            .expect("Failed to send update commit index message");
+                        debug!("Sent update commit index message to sync channel");
+                    } else {
+                        debug!(
+                            "Peer {} rejected {} entries, retrying from earlier entry",
+                            peer_addr, entries_len
                         );
                         // TODO backoff
-                        time::sleep(Duration::from_millis(10)).await;
+                        time::sleep(Duration::from_millis(5)).await;
+                        self.next_index -= 1;
                         continue;
                     }
-                };
-            }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to send AppendEntries to peer {}: {:?}, retrying",
+                        peer_addr, e
+                    );
+                    // TODO backoff
+                    time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
 
             // Give the peer some time to process the entries
             time::sleep(Duration::from_millis(10)).await;
