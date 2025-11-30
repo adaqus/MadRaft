@@ -183,6 +183,8 @@ async fn fail_agree_2b() {
 
 #[madsim::test]
 async fn fail_no_agree_2b() {
+    init_logger();
+    
     let servers = 5;
     let t = RaftTester::new(servers).await;
 
